@@ -41,12 +41,12 @@ PREMARKET_ROUTINE_TIME = "09:15"   # when to run ATR/gap pre-calc
 # Keys must match strategy IDs in strategies/__init__.py
 # =============================================================================
 STRATEGY_UNIVERSES: Dict[str, List[str]] = {
-    "orb_short":        ["GOOG", "MSFT", "AAPL"],   # ← fill in your symbols
-    "orb_long":         ["MSFT", "AAPL"],
-    "impulse_short":    ["PM", "MO"],
-    "gap_fill_large":   ["AAPL", "MSFT"],
-    "gap_fill_small":   ["MSFT", "JPM"],
-    "gap_fill_big":     ["MS", "GS"],
+    "orb_short":        ["AMZN", "C", "FCX", "GE", "LVS", "ORCL", "QCOM"],   # ← fill in your symbols
+    "orb_long":         ["BIDU", "CSCO", "F", "GOOG", "IBM", "JPM", "MSFT", "QCOM", "VZ", "WMT"],
+    "impulse_short":    ["EMC", "F", "FB", "FCX", "GOOG", "GOOGL", "GS", "HD", "HPQ", "JNJ", "JPM", "KO", "LOW", "MCD", "MRK", "MSFT", "ORCL", "PFE", "PM", "PSE", "T", "VZ", "WFC"],
+    "gap_fill_large":   ["AAPL", "MSFT", "WMT", "T", "PFE", "OXY", "ORCL", "NFLX", "MS", "LOW", "JPM", "HAL", "GE", "FCX", "F", "CSCO", "CRM", "CAT", "BIDU", "AMZN", "AMGN"],
+    "gap_fill_small":   ["AMZN", "CSCO", "F", "GILD", "GS", "HPQ", "JNJ", "LOW", "LVS", "MCD", "MS"],
+    "gap_fill_big":     ["MS", "T", "MCD", "LOW", "HPQ", "F", "CVX", "CSCO", "AMZN"],
 }
 
 # =============================================================================

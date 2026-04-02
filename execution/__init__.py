@@ -13,12 +13,46 @@ import logging
 import os
 import time
 import urllib.request
+from collections import deque
 from typing import Optional
 
 from ..models import OpenPosition, Signal
 from .. import config
 
 log = logging.getLogger("execution")
+
+
+# =============================================================================
+# RATE LIMITER
+# Prop firms cap inbound webhook actions. This enforces max 2 per 60 seconds
+# across ALL send_entry and send_exit calls, regardless of strategy or symbol.
+# If the limit is hit it sleeps until a slot opens — it never drops a signal.
+# =============================================================================
+
+class _RateLimiter:
+    """Token-bucket style rate limiter over a rolling time window."""
+
+    def __init__(self, max_calls: int = 2, period: float = 60.0):
+        self.max_calls = max_calls
+        self.period = period
+        self._timestamps: deque = deque()
+
+    def acquire(self):
+        now = time.monotonic()
+        # Evict timestamps that have fallen outside the rolling window
+        while self._timestamps and now - self._timestamps[0] >= self.period:
+            self._timestamps.popleft()
+        # If already at the cap, sleep until the oldest slot expires
+        if len(self._timestamps) >= self.max_calls:
+            sleep_for = self.period - (now - self._timestamps[0])
+            if sleep_for > 0:
+                log.info(f"[RateLimiter] cap reached — sleeping {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+        self._timestamps.append(time.monotonic())
+
+
+# One shared limiter instance — both entry and exit calls share the same budget
+_rate_limiter = _RateLimiter(max_calls=2, period=60.0)
 
 
 # =============================================================================
@@ -30,6 +64,7 @@ class PaperExecution:
     Simulates fills instantly at the signal's entry_price.
     Slippage is already baked in by the strategy module.
     Exit fills happen in the orchestrator's bar loop.
+    Rate limiter is intentionally skipped in paper mode.
     """
 
     def send_entry(self, pos: OpenPosition) -> bool:
@@ -74,8 +109,11 @@ class SignalStackExecution:
         self.webhook_url = config.SIGNALSTACK_WEBHOOK_URL
         self.api_key     = os.environ.get("SIGNALSTACK_API_KEY",
                                           config.SIGNALSTACK_API_KEY)
-        if self.api_key == "YOUR_SIGNALSTACK_API_KEY":
-            log.warning("SignalStack API key not set — set SIGNALSTACK_API_KEY env var.")
+        if not self.api_key or self.api_key == "YOUR_SIGNALSTACK_API_KEY":
+            raise RuntimeError(
+                "SignalStack API key not set. "
+                "Export SIGNALSTACK_API_KEY as an environment variable."
+            )
 
     def _post(self, payload: dict) -> bool:
         body = json.dumps(payload).encode("utf-8")
@@ -102,6 +140,7 @@ class SignalStackExecution:
             return False
 
     def send_entry(self, pos: OpenPosition) -> bool:
+        _rate_limiter.acquire()   # enforce 2-per-minute cap before firing
         action = "buy" if pos.direction == "long" else "sell"
         payload = {
             "ticker":    pos.symbol,
@@ -114,6 +153,7 @@ class SignalStackExecution:
         return self._post(payload)
 
     def send_exit(self, pos: OpenPosition, exit_price: float, reason: str) -> bool:
+        _rate_limiter.acquire()   # enforce 2-per-minute cap before firing
         # Close the position: opposite side
         action = "sell" if pos.direction == "long" else "buy"
         payload = {
