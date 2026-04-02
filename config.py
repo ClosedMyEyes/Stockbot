@@ -154,7 +154,6 @@ STRATEGY_PARAMS: Dict[str, dict] = {
         "vol_regime_max":           3.0,
         "gap_vol_ratio_min":        1.0,
         "gap_atr_ratio_min":        0.6,
-        "gap_atr_ratio_max":        0,
     },
     "gap_fill_small": {
         "gap_min_pct":              1.5,
