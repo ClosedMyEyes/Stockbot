@@ -1,72 +1,42 @@
-"""
-strategies/base.py — Abstract base class for all strategy modules.
-
-Each strategy subclass implements:
-  - reset_session(ctx)    called at 09:30 with fresh SessionContext
-  - on_bar(bar, ctx)      called on each 1-min bar close → returns Signal | None
-  - on_exit(result)       called when a position closes (for state cleanup)
-"""
+"""strategies/base.py — BaseStrategy abstract base class."""
 
 from abc import ABC, abstractmethod
 from typing import Optional
-from ..models import Signal, Bar, SessionContext
 
 
 class BaseStrategy(ABC):
-    """
-    One instance per (strategy_id, symbol) pair.
-    Stateful — carries its state machine across bars within a session.
-    """
 
     def __init__(self, strategy_id: str, symbol: str, params: dict):
         self.strategy_id = strategy_id
         self.symbol      = symbol
         self.params      = params
-        self.state       = "IDLE"
-        self._in_trade   = False   # set by orchestrator when signal is accepted
+        self._in_trade   = False
+
+    # ── Orchestrator callbacks ────────────────────────────────────────────────
 
     @abstractmethod
-    def reset_session(self, ctx: SessionContext) -> None:
-        """Called at session start (pre-open). Reset all intra-session state."""
-        ...
+    def reset_session(self, ctx) -> None:
+        """Called once at the start of each new session. Reset all state."""
 
     @abstractmethod
-    def on_bar(self, bar: Bar, ctx: SessionContext) -> Optional[Signal]:
+    def on_bar(self, bar, ctx):
         """
-        Process one bar. Returns a Signal if the strategy wants to enter,
-        otherwise None. Must NOT enter a trade on its own — that's the
-        orchestrator's job.
+        Called on every RTH bar. Return a Signal to enter a trade, or None.
+        Must NOT be called while _in_trade=True (orchestrator gates this).
         """
-        ...
 
-    def on_exit(self, result_r: float, exit_reason: str) -> None:
-        """Called by orchestrator when the position exits. Override if needed."""
-        self._in_trade = False
-        self.state     = "DONE"
-
-    def mark_in_trade(self):
-        """Called by orchestrator after accepting signal."""
+    def mark_in_trade(self) -> None:
+        """Called by orchestrator after a signal is accepted and executed."""
         self._in_trade = True
-        self.state     = "IN_TRADE"
 
-    # ── helpers shared across subclasses ─────────────────────────────────────
+    def on_exit(self, result_r: float, reason: str) -> None:
+        """
+        Called by orchestrator after a position closes.
+        Override to re-arm the strategy for a second entry (e.g. gap_fill_small_multi).
+        Default: stay dormant for the rest of the session (one-trade-per-session behaviour).
+        """
+        self._in_trade = False
+        # Subclasses that allow multiple trades override this to also reset state.
 
-    @staticmethod
-    def apply_slippage(price: float, direction: int, slippage_pct: float) -> float:
-        """direction: +1 = long (pay more), -1 = short (receive less)."""
-        return price + direction * price * slippage_pct
-
-    @staticmethod
-    def compute_tp_obs_level(entry: float, obs_level: float,
-                              direction: int, tp_mult: float) -> float:
-        """obs_level TP: scale between entry and obs extreme."""
-        distance = abs(obs_level - entry)
-        return entry + direction * tp_mult * distance
-
-    @staticmethod
-    def compute_tp_fixed_r(entry: float, R: float,
-                            direction: int, tp_mult: float) -> float:
-        return entry + direction * tp_mult * R
-
-    def __repr__(self):
-        return f"{self.strategy_id}({self.symbol}) [{self.state}]"
+    def __str__(self):
+        return f"{self.strategy_id}({self.symbol})"

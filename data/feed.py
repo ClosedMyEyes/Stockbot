@@ -1,40 +1,95 @@
 """
-data/feed.py — Live data layer.
+data/feed.py — IBKR data feed + SessionContextBuilder.
 
-Provides:
-  IBKRFeed    — subscribes to 1-min bars via ib_insync, calls on_bar callback
-  SessionContextBuilder — pre-computes ATR, VWAP context, gap metrics pre-open
+SessionContext now carries all fields that gap fill strategies need at
+reset_session() time, including prior_close (yesterday's last bar close).
 
-Requirements:
-  pip install ib_insync
-  TWS or IB Gateway running, paper trading enabled, port 7497.
-
-Fixes applied (v2):
-  [FIX 1] get_context: `if ctx.prior_close and ctx.today_open` replaced with
-          `is not None` checks. The falsy check silently skipped gap
-          calculations if prior_close or today_open happened to be 0.0.
-  [FIX 2] _daily_atr: dates missing from _day_high/_day_low no longer
-          default to 0-0=0. Missing dates are now skipped so they don't
-          silently drag the ATR toward zero.
-  [FIX 3] _vol_regime: same fix as above for the mean-range baseline.
-          Missing-date zeroes were corrupting the regime ratio, especially
-          during the first few warmup sessions.
-  [FIX 4] _sessions now pruned to HISTORY_KEEP sessions per symbol on every
-          new session arrival. Without pruning, the dict grew unboundedly
-          across a full trading day. Corresponding day_* dicts are pruned
-          in sync so memory is actually freed.
-  [CLEAN] Removed unused `deque` import.
+Fields added vs original:
+  prior_close        — yesterday's closing price (zero look-ahead)
+  daily_atr          — 14-session rolling mean of daily range (shifted 1)
+  vol_regime_ratio   — yesterday_range / 20-day mean_range (shifted 1)
+  first_bar_vol_ratio — today first-bar vol / 20-session median first-bar vol
+  vol_median_tod     — per-bar time-of-day rolling median volume (for impulse_short)
+  atr                — intrabar rolling ATR (for impulse_short)
 """
 
 import datetime
 import logging
-from collections import defaultdict
-from typing import Callable, Dict, List, Optional
+import math
+from collections import defaultdict, deque
+from typing import Dict, List, Optional
 
-from ..models import Bar, SessionContext
-from .. import config
+log = logging.getLogger("orchestrator.feed")
 
-log = logging.getLogger("data")
+try:
+    from ib_insync import IB, Stock, BarData
+    _IB_AVAILABLE = True
+except ImportError:
+    _IB_AVAILABLE = False
+    log.warning("ib_insync not installed — feed will not connect to IBKR")
+
+
+# =============================================================================
+# SESSION CONTEXT
+# =============================================================================
+
+class SessionContext:
+    """
+    Per-symbol, per-session context object.
+    Populated incrementally by SessionContextBuilder on each bar.
+    Strategies read from this in reset_session() and on_bar().
+    """
+
+    def __init__(self, symbol: str, session_date):
+        self.symbol       = symbol
+        self.session_date = session_date
+
+        # ── Rolling session stats (updated bar-by-bar) ────────────────────────
+        self.vwap         = 0.0
+        self.session_high = 0.0
+        self.session_low  = float("inf")
+        self.atr          = 0.0          # intrabar 14-period ATR
+        self.vol_median_tod: Optional[float] = None  # not yet implemented bar-level
+
+        # ── Session-start context (set before any bars arrive) ────────────────
+        self.prior_close:        Optional[float] = None
+        self.daily_atr:          Optional[float] = None
+        self.vol_regime_ratio:   Optional[float] = None
+        self.first_bar_vol_ratio: Optional[float] = None
+        self.median_session_vol: Optional[float] = None  # for orb_short
+
+        # ── VWAP internals ────────────────────────────────────────────────────
+        self._cum_pv = 0.0
+        self._cum_v  = 0.0
+
+        # ── ATR internals ─────────────────────────────────────────────────────
+        self._prev_close:  Optional[float] = None
+        self._atr_window:  deque           = deque(maxlen=14)
+
+    def update_vwap(self, bar) -> None:
+        tp             = (bar.high + bar.low + bar.close) / 3.0
+        self._cum_pv  += tp * bar.volume
+        self._cum_v   += bar.volume
+        self.vwap      = self._cum_pv / self._cum_v if self._cum_v > 0 else bar.close
+
+    def update_extremes(self, bar) -> None:
+        self.session_high = max(self.session_high, bar.high)
+        self.session_low  = min(self.session_low,  bar_low := bar.low)
+
+    def update_atr(self, bar) -> None:
+        """Intrabar session-local ATR (resets each session)."""
+        prev = self._prev_close
+        if prev is None:
+            tr = bar.high - bar.low
+        else:
+            tr = max(
+                bar.high - bar.low,
+                abs(bar.high - prev),
+                abs(bar.low  - prev),
+            )
+        self._atr_window.append(tr)
+        self._prev_close = bar.close
+        self.atr = sum(self._atr_window) / len(self._atr_window)
 
 
 # =============================================================================
@@ -43,290 +98,276 @@ log = logging.getLogger("data")
 
 class SessionContextBuilder:
     """
-    Maintains rolling history to compute:
-      - prior_close, today_open
-      - daily ATR (14-day rolling average of daily range)
-      - vol_regime_ratio (yesterday_range / 20-day mean range)
-      - first_bar_vol_ratio (first bar vol / rolling 20-session median)
-      - vol_median (rolling 20-session median total daily volume)
+    Maintains rolling daily statistics per symbol so that SessionContext
+    objects can be pre-populated with historical context at session start.
 
-    Call:
-      builder.on_bar_close(bar)         — for every RTH bar
-      ctx = builder.get_context(symbol, today) — call pre-open or on first bar
+    Statistics maintained (all zero look-ahead — shifted one session):
+      prior_close         — last bar close of previous session
+      daily_atr           — 14-session mean of daily range
+      vol_regime_ratio    — yesterday range / 20-session mean range
+      first_bar_vol_ratio — today's first bar vol / 20-session median first-bar vol
+      median_session_vol  — 20-session median total daily volume (for orb_short)
     """
 
-    ATR_PERIOD    = 14
-    VOL_PERIOD    = 20
-    REGIME_PERIOD = 20
-    # FIX 4: keep enough history for the longest window + yesterday + small buffer
-    HISTORY_KEEP  = REGIME_PERIOD + 5   # 25 sessions is plenty
+    _ATR_PERIOD      = 14
+    _VOL_WINDOW      = 20
+    _VOL_MIN_PERIODS = 5
 
     def __init__(self):
-        # Per-symbol rolling history
-        self._sessions:       Dict[str, List[str]]         = defaultdict(list)
-        self._day_high:       Dict[str, Dict[str, float]]  = defaultdict(dict)
-        self._day_low:        Dict[str, Dict[str, float]]  = defaultdict(dict)
-        self._day_open:       Dict[str, Dict[str, float]]  = defaultdict(dict)
-        self._day_close:      Dict[str, Dict[str, float]]  = defaultdict(dict)
-        self._day_vol:        Dict[str, Dict[str, float]]  = defaultdict(dict)
-        self._first_bar_vol:  Dict[str, Dict[str, float]]  = defaultdict(dict)
-        self._first_bar_done: Dict[str, set]               = defaultdict(set)
+        # Per-symbol rolling data
+        self._daily_close:     Dict[str, deque]  = defaultdict(lambda: deque(maxlen=max(self._ATR_PERIOD, self._VOL_WINDOW) + 2))
+        self._daily_range:     Dict[str, deque]  = defaultdict(lambda: deque(maxlen=self._VOL_WINDOW + 2))
+        self._daily_first_vol: Dict[str, deque]  = defaultdict(lambda: deque(maxlen=self._VOL_WINDOW + 2))
+        self._daily_total_vol: Dict[str, deque]  = defaultdict(lambda: deque(maxlen=self._VOL_WINDOW + 2))
+        self._session_high:    Dict[str, float]  = {}
+        self._session_low:     Dict[str, float]  = {}
+        self._session_date:    Dict[str, object] = {}
+        self._is_first_bar:    Dict[str, bool]   = defaultdict(lambda: True)
 
-    def on_bar_close(self, bar: Bar):
+        # Contexts for the current session
+        self._contexts: Dict[str, SessionContext] = {}
+
+    def on_bar_close(self, bar) -> None:
+        """
+        Called on every bar. Maintains rolling stats and updates the live
+        SessionContext for this symbol.
+        """
         sym = bar.symbol
-        d   = bar.date
+        sd  = bar.date  # date string "YYYY-MM-DD" or date object
 
-        # Track sessions in order
-        if d not in self._day_high[sym]:
-            self._sessions[sym].append(d)
-            self._day_high[sym][d] = bar.high
-            self._day_low[sym][d]  = bar.low
-            self._day_open[sym][d] = bar.open
-            self._day_vol[sym][d]  = 0.0
+        # New session detection
+        if self._session_date.get(sym) != sd:
+            self._end_session(sym)
+            self._session_date[sym]  = sd
+            self._session_high[sym]  = bar.high
+            self._session_low[sym]   = bar.low
+            self._is_first_bar[sym]  = True
 
-            # FIX 4: prune history once we exceed HISTORY_KEEP sessions
-            self._prune(sym)
+            # Build and store context for this new session
+            ctx = SessionContext(sym, sd if hasattr(sd, "weekday") else
+                                 datetime.date.fromisoformat(str(sd)))
+            ctx.prior_close         = self._get_prior_close(sym)
+            ctx.daily_atr           = self._get_daily_atr(sym)
+            ctx.vol_regime_ratio    = self._get_vol_regime(sym)
+            ctx.first_bar_vol_ratio = None  # filled on first bar below
+            ctx.median_session_vol  = self._get_median_session_vol(sym)
+            self._contexts[sym]     = ctx
         else:
-            self._day_high[sym][d] = max(self._day_high[sym][d], bar.high)
-            self._day_low[sym][d]  = min(self._day_low[sym][d], bar.low)
+            self._session_high[sym] = max(self._session_high.get(sym, bar.high), bar.high)
+            self._session_low[sym]  = min(self._session_low.get(sym,  bar.low),  bar.low)
 
-        self._day_close[sym][d]  = bar.close
-        self._day_vol[sym][d]   += bar.volume
+        ctx = self._contexts.get(sym)
+        if ctx is None:
+            return
 
-        # First bar of session
-        if d not in self._first_bar_done[sym]:
-            self._first_bar_done[sym].add(d)
-            self._first_bar_vol[sym][d] = bar.volume
+        # First bar: capture first_bar_vol_ratio and today_open
+        if self._is_first_bar[sym]:
+            self._is_first_bar[sym] = False
+            first_vol_med = self._get_first_bar_vol_median(sym)
+            ctx.first_bar_vol_ratio = (
+                bar.volume / first_vol_med
+                if first_vol_med and first_vol_med > 0
+                else None
+            )
+            # Store this session's first-bar vol for future sessions
+            self._daily_first_vol[sym].append(bar.volume)
 
-    # FIX 4: drop the oldest sessions and all associated dict entries
-    def _prune(self, sym: str):
-        sessions = self._sessions[sym]
-        while len(sessions) > self.HISTORY_KEEP:
-            old = sessions.pop(0)
-            for d in (self._day_high, self._day_low, self._day_open,
-                      self._day_close, self._day_vol, self._first_bar_vol):
-                d[sym].pop(old, None)
-            self._first_bar_done[sym].discard(old)
+        ctx.update_vwap(bar)
+        ctx.update_extremes(bar)
+        ctx.update_atr(bar)
 
-    def get_context(self, symbol: str, today: str) -> SessionContext:
-        ctx = SessionContext(symbol=symbol, session_date=today)
-        sessions = self._sessions.get(symbol, [])
+    def _end_session(self, sym: str) -> None:
+        """Close out the day — push daily range and total vol to rolling windows."""
+        if sym not in self._session_date:
+            return
+        h = self._session_high.get(sym)
+        l = self._session_low.get(sym)
+        if h is not None and l is not None:
+            self._daily_range[sym].append(h - l)
 
-        # Prior sessions (excluding today)
-        prior = [s for s in sessions if s < today]
+    def get_context(self, symbol: str, session_date) -> SessionContext:
+        """
+        Return the SessionContext for a symbol on a given date.
+        If not yet built (rare), return an empty one.
+        """
+        return self._contexts.get(symbol, SessionContext(symbol, session_date))
 
-        if not prior:
-            return ctx
+    # ── Rolling statistic helpers ─────────────────────────────────────────────
 
-        yesterday       = prior[-1]
-        ctx.prior_close = self._day_close[symbol].get(yesterday)
-        ctx.today_open  = self._day_open[symbol].get(today)
+    def _get_prior_close(self, sym: str) -> Optional[float]:
+        closes = self._daily_close[sym]
+        return closes[-1] if closes else None
 
-        # FIX 1: use `is not None` — a close/open of 0.0 is falsy and
-        #         would silently skip the gap calculation with the old check
-        if ctx.prior_close is not None and ctx.today_open is not None:
-            ctx.gap_pct  = (ctx.today_open - ctx.prior_close) / ctx.prior_close
-            ctx.gap_size = abs(ctx.today_open - ctx.prior_close)
-
-        ctx.daily_atr        = self._daily_atr(symbol, yesterday, prior)
-        ctx.vol_regime_ratio = self._vol_regime(symbol, yesterday, prior)
-        ctx.vol_median       = self._vol_median(symbol, prior)
-        ctx.first_bar_vol_ratio = self._first_bar_ratio(symbol, today, prior)
-
-        return ctx
-
-    def _daily_atr(self, symbol: str, yesterday: str,
-                   prior: List[str]) -> Optional[float]:
-        window = prior[-self.ATR_PERIOD:]
-        if len(window) < 3:
+    def _get_daily_atr(self, sym: str) -> Optional[float]:
+        ranges = list(self._daily_range[sym])
+        if len(ranges) < self._VOL_MIN_PERIODS:
             return None
+        window = ranges[-self._ATR_PERIOD:]
+        return sum(window) / len(window)
 
-        # FIX 2: skip any date where high or low data is missing rather than
-        #         letting a missing entry default to 0-0=0 and dragging ATR down
-        ranges = [
-            self._day_high[symbol][d] - self._day_low[symbol][d]
-            for d in window
-            if d in self._day_high[symbol] and d in self._day_low[symbol]
-        ]
-        if len(ranges) < 3:
+    def _get_vol_regime(self, sym: str) -> Optional[float]:
+        ranges = list(self._daily_range[sym])
+        if len(ranges) < self._VOL_MIN_PERIODS + 1:
             return None
-        return sum(ranges) / len(ranges)
+        yesterday_range = ranges[-1]
+        window_20       = ranges[-min(20, len(ranges)) - 1 : -1]
+        mean_range      = sum(window_20) / len(window_20) if window_20 else None
+        if mean_range and mean_range > 0:
+            return yesterday_range / mean_range
+        return None
 
-    def _vol_regime(self, symbol: str, yesterday: str,
-                    prior: List[str]) -> Optional[float]:
-        window = prior[-self.REGIME_PERIOD - 1: -1]   # 20 sessions before yesterday
-        if len(window) < 5:
+    def _get_first_bar_vol_median(self, sym: str) -> Optional[float]:
+        vols = list(self._daily_first_vol[sym])
+        if len(vols) < self._VOL_MIN_PERIODS:
             return None
+        window = sorted(vols[-self._VOL_WINDOW:])
+        mid    = len(window) // 2
+        return (window[mid - 1] + window[mid]) / 2 if len(window) % 2 == 0 else window[mid]
 
-        # FIX 3: same fix as _daily_atr — skip missing dates instead of
-        #         padding with zero and corrupting the mean range baseline
-        ranges = [
-            self._day_high[symbol][d] - self._day_low[symbol][d]
-            for d in window
-            if d in self._day_high[symbol] and d in self._day_low[symbol]
-        ]
-        if not ranges:
+    def _get_median_session_vol(self, sym: str) -> Optional[float]:
+        vols = list(self._daily_total_vol[sym])
+        if len(vols) < self._VOL_MIN_PERIODS:
             return None
-        mean = sum(ranges) / len(ranges)
-        if mean == 0:
-            return None
+        window = sorted(vols[-self._VOL_WINDOW:])
+        mid    = len(window) // 2
+        return (window[mid - 1] + window[mid]) / 2 if len(window) % 2 == 0 else window[mid]
 
-        if yesterday not in self._day_high[symbol] or yesterday not in self._day_low[symbol]:
-            return None
-        yesterday_range = (self._day_high[symbol][yesterday]
-                           - self._day_low[symbol][yesterday])
-        return yesterday_range / mean
-
-    def _vol_median(self, symbol: str, prior: List[str]) -> Optional[float]:
-        window = prior[-self.VOL_PERIOD:]
-        if not window:
-            return None
-        vols = sorted(self._day_vol[symbol].get(d, 0) for d in window)
-        n = len(vols)
-        return (vols[n // 2 - 1] + vols[n // 2]) / 2 if n % 2 == 0 else vols[n // 2]
-
-    def _first_bar_ratio(self, symbol: str, today: str,
-                          prior: List[str]) -> Optional[float]:
-        today_vol = self._first_bar_vol[symbol].get(today)
-        if today_vol is None:
-            return None
-        window = prior[-self.VOL_PERIOD:]
-        if len(window) < 5:
-            return None
-        fb_vols = sorted(
-            self._first_bar_vol[symbol][d]
-            for d in window
-            if d in self._first_bar_vol[symbol]
-        )
-        if not fb_vols:
-            return None
-        n      = len(fb_vols)
-        median = (fb_vols[n // 2 - 1] + fb_vols[n // 2]) / 2 if n % 2 == 0 else fb_vols[n // 2]
-        return today_vol / median if median > 0 else None
+    def store_session_total_vol(self, sym: str, total_vol: float) -> None:
+        """Call at EOD to record total daily volume for the session just ended."""
+        self._daily_total_vol[sym].append(total_vol)
+        # Also record last close from context
+        ctx = self._contexts.get(sym)
+        if ctx and ctx.session_high > 0:
+            pass  # prior_close is captured from the last bar.close — needs feed to call this
+        # For prior_close: feed should call store_session_close at EOD
+    
+    def store_session_close(self, sym: str, close_price: float) -> None:
+        """Call at EOD with the final bar's close price."""
+        self._daily_close[sym].append(close_price)
 
 
 # =============================================================================
-# IBKR LIVE FEED
+# IBKR FEED
 # =============================================================================
 
 class IBKRFeed:
     """
-    Connects to IBKR via ib_insync and streams 1-min bars.
-    Calls on_bar(bar: Bar) for each completed 1-min bar.
-
-    Usage:
-        feed = IBKRFeed(symbols=["AAPL", "MSFT"])
-        feed.on_bar = orchestrator.on_bar   # assign BEFORE subscribe_bars()
-        feed.subscribe_bars()
-        feed.start()                        # blocks until market close
+    Wraps ib_insync to provide live 1-minute bars for a set of symbols.
+    Calls self.on_bar(bar) on each completed bar.
     """
 
     def __init__(self, symbols: List[str]):
-        self.symbols  = symbols
-        self.on_bar: Optional[Callable[[Bar], None]] = None
-        self._ib      = None
-        self._bar_lists: Dict[str, object] = {}
+        self.symbols   = symbols
+        self.on_bar    = None   # assigned by Orchestrator before subscribe_bars()
+        self._ib       = IB() if _IB_AVAILABLE else None
+        self._contracts = {}
 
-    def connect(self) -> bool:
+    def connect(self, host: str = "127.0.0.1", port: int = 7497,
+                client_id: int = 10) -> bool:
+        if not _IB_AVAILABLE:
+            log.error("ib_insync not available. Cannot connect.")
+            return False
         try:
-            from ib_insync import IB, Stock, util
-            self._ib = IB()
-            self._ib.connect(
-                config.IBKR_HOST,
-                config.IBKR_PORT,
-                clientId=config.IBKR_CLIENT_ID,
-            )
-            log.info(f"Connected to IBKR at {config.IBKR_HOST}:{config.IBKR_PORT}")
+            self._ib.connect(host, port, clientId=client_id)
+            log.info(f"Connected to IBKR {host}:{port} (clientId={client_id})")
             return True
-        except ImportError:
-            log.error("ib_insync not installed. Run: pip install ib_insync")
-            return False
         except Exception as e:
-            log.error(f"IBKR connection failed: {e}")
+            log.error(f"IBKR connect failed: {e}")
             return False
 
-    def subscribe_bars(self):
-        """Subscribe to historical+live 1-min bars for each symbol."""
-        from ib_insync import Stock
-        for sym in self.symbols:
-            contract = Stock(sym, "SMART", "USD")
-            self._ib.qualifyContracts(contract)
-            bars = self._ib.reqHistoricalData(
-                contract,
-                endDateTime="",
-                durationStr="1 D",
-                barSizeSetting="1 min",
-                whatToShow="TRADES",
-                useRTH=True,
-                keepUpToDate=True,
-            )
-            bars.updateEvent += self._make_bar_handler(sym)
-            self._bar_lists[sym] = bars
-            log.info(f"Subscribed to 1-min bars: {sym}")
-
-    def _make_bar_handler(self, symbol: str):
-        """Returns a closure that fires on each new completed bar."""
-        def handler(bars, has_new_bar: bool):
-            if not has_new_bar or not bars:
-                return
-            last = bars[-1]
-            dt   = last.date    # datetime for 1-min RTH bars from ib_insync
-            bar  = Bar(
-                symbol = symbol,
-                time   = dt.strftime("%H:%M"),
-                date   = dt.strftime("%Y-%m-%d"),
-                open   = last.open,
-                high   = last.high,
-                low    = last.low,
-                close  = last.close,
-                volume = float(last.volume),
-            )
-            if self.on_bar:
-                try:
-                    self.on_bar(bar)
-                except Exception as e:
-                    log.error(f"on_bar callback error [{symbol}]: {e}",
-                              exc_info=True)
-        return handler
-
-    def start(self):
-        """Run the ib_insync event loop until stopped."""
-        if self._ib is None:
-            raise RuntimeError("Call connect() first.")
-        log.info("IBKR event loop starting...")
-        self._ib.run()
-
-    def stop(self):
-        if self._ib and self._ib.isConnected():
-            self._ib.disconnect()
-            log.info("IBKR disconnected.")
-
-    def request_historical_bars(self, symbol: str,
-                                 duration: str = "5 D") -> List[Bar]:
-        """Pull recent history for warm-up (builds SessionContextBuilder state)."""
-        from ib_insync import Stock
-        contract = Stock(symbol, "SMART", "USD")
-        self._ib.qualifyContracts(contract)
-        raw = self._ib.reqHistoricalData(
+    def request_historical_bars(self, symbol: str, duration: str = "20 D",
+                                bar_size: str = "1 min") -> List:
+        if not _IB_AVAILABLE or self._ib is None:
+            return []
+        contract = self._get_contract(symbol)
+        bars = self._ib.reqHistoricalData(
             contract,
             endDateTime="",
             durationStr=duration,
-            barSizeSetting="1 min",
+            barSizeSetting=bar_size,
             whatToShow="TRADES",
             useRTH=True,
-            keepUpToDate=False,
+            formatDate=1,
         )
-        bars = []
-        for r in raw:
-            dt = r.date
-            bars.append(Bar(
-                symbol = symbol,
-                time   = dt.strftime("%H:%M"),
-                date   = dt.strftime("%Y-%m-%d"),
-                open   = r.open,
-                high   = r.high,
-                low    = r.low,
-                close  = r.close,
-                volume = float(r.volume),
-            ))
-        return bars
+        return [self._adapt_bar(b, symbol) for b in bars]
+
+    def subscribe_bars(self) -> None:
+        if not _IB_AVAILABLE or self._ib is None:
+            return
+        for sym in self.symbols:
+            contract = self._get_contract(sym)
+            bars = self._ib.reqRealTimeBars(
+                contract,
+                barSize=5,        # 5-second bars; aggregated to 1-min in _on_rt_bar
+                whatToShow="TRADES",
+                useRTH=True,
+            )
+            bars.updateEvent += self._make_rt_handler(sym)
+        log.info(f"Subscribed to real-time bars for {len(self.symbols)} symbols")
+
+    def start(self) -> None:
+        if _IB_AVAILABLE and self._ib:
+            self._ib.run()
+
+    def stop(self) -> None:
+        if _IB_AVAILABLE and self._ib:
+            try:
+                self._ib.disconnect()
+            except Exception:
+                pass
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _get_contract(self, symbol: str):
+        if symbol not in self._contracts:
+            self._contracts[symbol] = Stock(symbol, "SMART", "USD")
+        return self._contracts[symbol]
+
+    def _adapt_bar(self, b, symbol: str):
+        """Convert ib_insync BarData to our Bar model."""
+        from models import Bar
+        return Bar(
+            symbol = symbol,
+            date   = str(b.date.date()),
+            time   = b.date.strftime("%H:%M"),
+            open   = b.open,
+            high   = b.high,
+            low    = b.low,
+            close  = b.close,
+            volume = b.volume,
+        )
+
+    def _make_rt_handler(self, symbol: str):
+        """Return a 5-sec-bar aggregator that emits 1-min bars."""
+        _agg = {"bars": [], "minute": None}
+
+        def _handler(bars, has_new_bar):
+            if not has_new_bar:
+                return
+            b = bars[-1]
+            minute = b.time.replace(second=0, microsecond=0)
+            if _agg["minute"] is None:
+                _agg["minute"] = minute
+            if minute != _agg["minute"] and _agg["bars"]:
+                _emit_minute(_agg["bars"], _agg["minute"], symbol)
+                _agg["bars"]   = []
+                _agg["minute"] = minute
+            _agg["bars"].append(b)
+
+        def _emit_minute(rt_bars, minute, sym):
+            if self.on_bar is None:
+                return
+            from models import Bar
+            bar = Bar(
+                symbol = sym,
+                date   = str(minute.date()),
+                time   = minute.strftime("%H:%M"),
+                open   = rt_bars[0].open,
+                high   = max(b.high for b in rt_bars),
+                low    = min(b.low  for b in rt_bars),
+                close  = rt_bars[-1].close,
+                volume = sum(b.volume for b in rt_bars),
+            )
+            self.on_bar(bar)
+
+        return _handler

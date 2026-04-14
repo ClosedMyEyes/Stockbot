@@ -1,28 +1,22 @@
 """
 strategies/impulse_short.py — Exhausted Impulse Retest (Short).
-Extracted from short.py.
 
-7-state machine:
-  WAIT_BREAK → BUILD_PEAK → TRACK_PULLBACK → WAIT_RETEST
-  → WAIT_FAILURE → WAIT_FILL → DONE (signal emitted)
+State machine: WAIT_BREAK → BUILD_PEAK → TRACK_PULLBACK → WAIT_RETEST
+              → WAIT_FAILURE → WAIT_FILL → (Signal emitted) → orchestrator manages exit.
 
-The orchestrator handles IN_TRADE once the signal is accepted.
+One trade per session (default). on_exit() keeps _in_trade=False, stays dormant.
 """
 
 import datetime
 import numpy as np
-from typing import Optional, List
 from .base import BaseStrategy
-from ..models import Signal, Bar, SessionContext
 
-
-WAIT_BREAK     = "WAIT_BREAK"
-BUILD_PEAK     = "BUILD_PEAK"
-TRACK_PULLBACK = "TRACK_PULLBACK"
-WAIT_RETEST    = "WAIT_RETEST"
-WAIT_FAILURE   = "WAIT_FAILURE"
-WAIT_FILL      = "WAIT_FILL"
-DONE           = "DONE"
+_WAIT_BREAK     = 0
+_BUILD_PEAK     = 1
+_TRACK_PULLBACK = 2
+_WAIT_RETEST    = 3
+_WAIT_FAILURE   = 4
+_WAIT_FILL      = 5
 
 X_FULL           = 20
 X_MIN            = 10
@@ -31,411 +25,333 @@ NO_NEW_LOW_STOP  = 5
 PEAK_CUTOFF      = "15:45"
 
 
-class ImpulseShort(BaseStrategy):
+def _backwalk_impulse_low(lows_arr, i, floor_low=None, max_back=50, stop_no_new_low=5):
+    j = i - 1
+    if j < 0:
+        return None
+    imp_low    = floor_low if floor_low is not None else lows_arr[j]
+    no_new_low = 0
+    steps      = 0
+    while j - 1 >= 0 and steps < max_back and no_new_low < stop_no_new_low:
+        j     -= 1
+        steps += 1
+        if lows_arr[j] < imp_low:
+            imp_low    = lows_arr[j]
+            no_new_low = 0
+        else:
+            no_new_low += 1
+    return imp_low
 
-    def __init__(self, symbol: str, params: dict):
-        super().__init__("impulse_short", symbol, params)
-        p = params
-        self.ATR_IMPULSE_MULT      = p["atr_impulse_mult"]
-        self.IMPULSE_SIZE_PCT_MIN  = p["impulse_size_pct_min"] / 100.0
-        self.IMPULSE_MIN_BARS      = p["impulse_min_bars"]
-        self.DEEP_RETRACE_MIN      = p["deep_retrace_min"]
-        self.DEEP_RETRACE_MAX      = p["deep_retrace_max"]
-        self.RETEST_PCT            = p["retest_pct"] / 100.0
-        self.RETEST_MAX_BARS       = p["retest_max_bars"]
-        self.STOP_BUFFER_MULT      = p["stop_buffer_mult"]
-        self.TP_MODE               = p["tp_mode"]
-        self.TP_FIXED_MULT         = p["tp_fixed_mult"]
-        self.MIN_R_PCT             = p["min_r_pct"] / 100.0
-        self.SLIPPAGE_PCT          = p["slippage_pct"] / 100.0
-        self.BREAKOUT_IBS_MIN      = p.get("breakout_ibs_min", 0.95)
-        self.MIN_FAILURE_BODY_PCT  = p.get("min_failure_body_pct", 85) / 100.0
-        self.MAX_PULLBACK_VOL      = p.get("max_pullback_vol_ratio", 1.8)
-        self.BREAKOUT_MIN          = p.get("breakout_min", 0.75)
-        self.ENTRY_TIME_START      = p.get("entry_time_start", "09:30")
-        self.ENTRY_TIME_END        = p.get("entry_time_end", "15:55")
-        self.EMA_SLOPE_BARS        = p.get("ema_slope_bars", 0)
 
-        # session buffers (filled via reset_session)
-        self._highs: List[float] = []
-        self._lows:  List[float] = []
-        self._closes: List[float] = []
-        self._atrs:   List[float] = []
-        self._vwaps:  List[float] = []
-        self._emas:   List[float] = []
-        self._vols:   List[float] = []
-        self._times:  List[str]   = []
-        self._vol_median_tod: List[float] = []
-        self._reset_sv()
+def _reset_sv():
+    return dict(
+        impulse_low=None, impulse_high=None, impulse_size=None,
+        impulse_atr_ratio=None, impulse_size_pct=None,
+        breakout_bar_range_atr=None, impulse_consec_bars=None,
+        peak_time=None, peak_bar_idx=None, pullback_low=None,
+        deep_retrace_ratio=None, bars_in_pullback=None,
+        retest_bar_idx=None, retest_wick_extension=None,
+        failure_candle_body_pct=None, failure_candle_close_vs_vwap=None,
+        entry_price=None, stop=None, tp=None, R=None,
+        entry_time=None, entry_bar_i=None,
+        vwap_at_entry=None, entry_vs_vwap_pct=None, session_atr=None,
+        impulse_bar_vol_vs_median=None, pullback_vol_ratio=None,
+        retest_bar_vol_vs_median=None,
+        breakout_bar_idx=None, breakout_ibs=None,
+        ref_high=None, base_low=None,
+        _impulse_bar_vol=None, _pullback_vol_sum=0.0,
+    )
 
-    def _reset_sv(self):
-        self.sv = dict(
-            impulse_low=None, impulse_high=None, impulse_size=None,
-            peak_time=None, peak_bar_idx=None, breakout_bar_idx=None,
-            pullback_low=None, deep_retrace_ratio=None, bars_in_pullback=None,
-            retest_bar_idx=None, retest_wick_extension=None,
-            failure_candle_body_pct=None, failure_candle_close_vs_vwap=None,
-            stop=None, tp=None,
-            ref_high=None, base_low=None,
-            breakout_ibs=None, impulse_atr_ratio=None,
-            impulse_consec_bars=None, breakout_bar_range_atr=None,
-            _impulse_bar_vol=None, _pullback_vol_sum=0.0,
-            pullback_vol_ratio=None,
-        )
 
-    def reset_session(self, ctx: SessionContext) -> None:
-        self.state = WAIT_BREAK
-        self._reset_sv()
-        self._highs.clear()
-        self._lows.clear()
-        self._closes.clear()
-        self._atrs.clear()
-        self._vwaps.clear()
-        self._emas.clear()
-        self._vols.clear()
-        self._times.clear()
-        self._vol_median_tod.clear()
-        self._skipped = False
+class ImpulseShortStrategy(BaseStrategy):
 
-    def on_bar(self, bar: Bar, ctx: SessionContext) -> Optional[Signal]:
-        if self._skipped or self.state == DONE or self._in_trade:
+    def reset_session(self, ctx) -> None:
+        self._state    = _WAIT_BREAK
+        self._sv       = _reset_sv()
+        self._bars     = []          # accumulate (open,high,low,close,vol,time,vwap,atr,vol_med)
+        self._bar_idx  = 0
+        self._in_trade = False
+        self._session_active = True
+
+    def on_bar(self, bar, ctx) -> None:
+        if not self._session_active or self._in_trade:
             return None
 
-        # Accumulate bar arrays
-        i = len(self._highs)
-        self._highs.append(bar.high)
-        self._lows.append(bar.low)
-        self._closes.append(bar.close)
-        self._vols.append(bar.volume)
-        self._times.append(bar.time)
-        # ATR from session context (we'll approximate using running intrabar TR)
-        # The ctx doesn't carry bar-level ATR, so we compute it inline
-        _atr = self._rolling_atr(i)
-        self._atrs.append(_atr)
-        self._vwaps.append(ctx.vwap)
-        # EMA approximation (exponential smoothing on close)
-        if len(self._emas) == 0:
-            self._emas.append(bar.close)
-        else:
-            span = max(self.EMA_SLOPE_BARS if self.EMA_SLOPE_BARS > 0 else 20, 2)
-            alpha = 2 / (span + 1)
-            self._emas.append(alpha * bar.close + (1 - alpha) * self._emas[-1])
-        # vol_median_tod approximation: use ctx.vol_median as a proxy
-        self._vol_median_tod.append(ctx.vol_median or bar.volume)
+        p = self.params
+        ATR_MULT      = p.get("atr_impulse_mult", 0.9)
+        SIZE_PCT_MIN  = p.get("impulse_size_pct_min", 0.7) / 100.0
+        IMPULSE_MIN_B = p.get("impulse_min_bars", 0)
+        DR_MIN        = p.get("deep_retrace_min", 0.60)
+        DR_MAX        = p.get("deep_retrace_max", 0.95)
+        RETEST_PCT    = p.get("retest_pct", 0.10) / 100.0
+        RETEST_MAX_B  = p.get("retest_max_bars", 15)
+        STOP_BUF      = p.get("stop_buffer_mult", 0.10)
+        TP_MODE       = p.get("tp_mode", "fixed")
+        TP_MULT       = p.get("tp_fixed_mult", 1.0)
+        MIN_R         = p.get("min_r_pct", 0.08) / 100.0
+        SLIP          = p.get("slippage_pct", 0.05) / 100.0
+        IBS_MIN       = p.get("breakout_ibs_min", 0.95)
+        FAIL_BODY_MIN = p.get("min_failure_body_pct", 85) / 100.0
+        PB_VOL_MAX    = p.get("max_pullback_vol_ratio", 1.8)
+        BK_MIN        = p.get("breakout_min", 0.75)
+        ENTRY_T_START = p.get("entry_time_start", "09:30")
+        ENTRY_T_END   = p.get("entry_time_end",   "15:55")
+        EMA_SLOPE_B   = p.get("ema_slope_bars", 0)
+
+        i         = self._bar_idx
+        bar_high  = bar.high
+        bar_low   = bar.low
+        bar_close = bar.close
+        bar_open  = bar.open
+        bar_vol   = bar.volume
+        bar_label = bar.time
+        vwap_now  = ctx.vwap
+        bar_atr   = ctx.atr if hasattr(ctx, "atr") else None
+        vol_med   = getattr(ctx, "vol_median_tod", None)
+
+        # Cache for backwalk
+        self._bars.append((bar_open, bar_high, bar_low, bar_close, bar_vol, bar_label, vwap_now, bar_atr, vol_med))
+        self._bar_idx += 1
+
+        sv = self._sv
 
         if i < X_MIN:
             return None
-
-        return self._dispatch(i, bar, ctx)
-
-    def _rolling_atr(self, i: int, period: int = 14) -> float:
-        n = min(i + 1, period)
-        if n == 0:
-            return self._highs[i] - self._lows[i]
-        trs = []
-        for k in range(max(0, i - n + 1), i + 1):
-            hl = self._highs[k] - self._lows[k]
-            trs.append(hl)
-        return sum(trs) / len(trs)
-
-    def _dispatch(self, i: int, bar: Bar, ctx: SessionContext) -> Optional[Signal]:
-        if self.state == WAIT_BREAK:
-            return self._handle_wait_break(i, bar)
-        elif self.state == BUILD_PEAK:
-            return self._handle_build_peak(i, bar)
-        elif self.state == TRACK_PULLBACK:
-            return self._handle_track_pullback(i, bar)
-        elif self.state == WAIT_RETEST:
-            return self._handle_wait_retest(i, bar)
-        elif self.state == WAIT_FAILURE:
-            return self._handle_wait_failure(i, bar)
-        elif self.state == WAIT_FILL:
-            return self._handle_wait_fill(i, bar)
-        return None
-
-    def _handle_wait_break(self, i: int, bar: Bar) -> Optional[Signal]:
         lookback = min(i, X_FULL)
-        prior_high = max(self._highs[i - lookback: i]) if lookback > 0 else bar.high
-        prior_low  = min(self._lows[i - lookback: i])  if lookback > 0 else bar.low
+        prior_highs = [self._bars[j][1] for j in range(i - lookback, i)]
+        prior_lows  = [self._bars[j][2] for j in range(i - lookback, i)]
 
-        _thresh = prior_high * 0.0001
-        floor_for_walk = self.sv["base_low"]
-        if self.sv["ref_high"] is None or (prior_high - self.sv["ref_high"]) > _thresh:
-            self.sv["ref_high"] = prior_high
-            self.sv["base_low"] = bar.low
-        else:
-            self.sv["base_low"] = min(self.sv["base_low"] or bar.low, bar.low)
+        # ── WAIT_BREAK ────────────────────────────────────────────────────────
+        if self._state == _WAIT_BREAK:
+            rolling_high = max(prior_highs)
+            rolling_low  = min(prior_lows)
 
-        if bar.close <= prior_high:
-            return None
-
-        # Structure break detected — walk left for impulse base
-        imp_low = floor_for_walk or prior_low
-        imp_low = self._backwalk(i, floor_low=imp_low)
-        imp_high = bar.high
-        imp_size = imp_high - imp_low
-
-        bar_atr  = self._atrs[i - 1] if i > 0 else imp_size
-        if self.ATR_IMPULSE_MULT > 0 and bar_atr > 0 and imp_size < self.ATR_IMPULSE_MULT * bar_atr:
-            return None
-
-        if self.IMPULSE_SIZE_PCT_MIN > 0:
-            if (imp_size / imp_high) < self.IMPULSE_SIZE_PCT_MIN:
-                return None
-
-        bar_range = bar.high - bar.low
-        if self.BREAKOUT_MIN > 0 and bar_atr > 0:
-            if bar_range < self.BREAKOUT_MIN * bar_atr:
-                return None
-
-        if self.BREAKOUT_IBS_MIN > 0 and bar_range > 0:
-            ibs = (bar.close - bar.low) / bar_range
-            if ibs < self.BREAKOUT_IBS_MIN:
-                return None
-
-        consec = 1
-        for k in range(i - 1, max(i - lookback - 1, 0), -1):
-            if self._closes[k] < self._closes[k + 1]:
-                consec += 1
+            _thresh = rolling_high * 0.0001
+            floor_for_walk = sv["base_low"]
+            if sv["ref_high"] is None or (rolling_high - sv["ref_high"]) > _thresh:
+                sv["ref_high"] = rolling_high
+                sv["base_low"] = bar_low
             else:
-                break
-        if self.IMPULSE_MIN_BARS > 1 and consec < self.IMPULSE_MIN_BARS:
-            return None
+                sv["base_low"] = min(sv["base_low"], bar_low)
 
-        self.sv["impulse_low"]           = imp_low
-        self.sv["impulse_high"]          = imp_high
-        self.sv["impulse_size"]          = imp_size
-        self.sv["peak_time"]             = bar.time
-        self.sv["peak_bar_idx"]          = i
-        self.sv["breakout_bar_idx"]      = i
-        _br_range = bar.high - bar.low
-        self.sv["breakout_ibs"]          = (bar.close - bar.low) / _br_range if _br_range > 0 else None
-        self.sv["impulse_atr_ratio"]     = imp_size / bar_atr if bar_atr > 0 else None
-        self.sv["breakout_bar_range_atr"]= _br_range / bar_atr if bar_atr > 0 else None
-        self.sv["impulse_consec_bars"]   = consec
-        self.sv["_impulse_bar_vol"]      = bar.volume
-        self.sv["_pullback_vol_sum"]     = 0.0
-        self.state = BUILD_PEAK
-        return None
-
-    def _handle_build_peak(self, i: int, bar: Bar) -> Optional[Signal]:
-        if bar.high > self.sv["impulse_high"]:
-            self.sv["impulse_high"] = bar.high
-            self.sv["impulse_size"] = bar.high - self.sv["impulse_low"]
-            self.sv["peak_time"]    = bar.time
-            self.sv["peak_bar_idx"] = i
-        elif bar.close < bar.open:
-            if bar.time >= PEAK_CUTOFF:
-                self.state = WAIT_BREAK
-                self._reset_sv()
-                return None
-            if self.EMA_SLOPE_BARS > 0 and self.sv["peak_bar_idx"] >= self.EMA_SLOPE_BARS:
-                ema_now  = self._emas[self.sv["peak_bar_idx"]]
-                ema_prev = self._emas[self.sv["peak_bar_idx"] - self.EMA_SLOPE_BARS]
-                if ema_now >= ema_prev:
-                    self.state = WAIT_BREAK
-                    self._reset_sv()
-                    return None
-            self.sv["pullback_low"] = bar.low
-            self.state = TRACK_PULLBACK
-        return None
-
-    def _handle_track_pullback(self, i: int, bar: Bar) -> Optional[Signal]:
-        if bar.high > self.sv["impulse_high"]:
-            self.sv["impulse_high"] = bar.high
-            self.sv["impulse_size"] = bar.high - self.sv["impulse_low"]
-            self.sv["peak_time"]    = bar.time
-            self.sv["peak_bar_idx"] = i
-            self.sv["pullback_low"] = None
-            self.sv["_pullback_vol_sum"] = 0.0
-            self.state = BUILD_PEAK
-            return None
-
-        self.sv["pullback_low"] = min(self.sv["pullback_low"] or bar.low, bar.low)
-        self.sv["_pullback_vol_sum"] += bar.volume
-        retrace = self.sv["impulse_high"] - self.sv["pullback_low"]
-        ratio   = retrace / self.sv["impulse_size"] if self.sv["impulse_size"] > 0 else 0
-
-        if ratio > self.DEEP_RETRACE_MAX:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
-
-        if ratio >= self.DEEP_RETRACE_MIN:
-            self.sv["deep_retrace_ratio"] = ratio
-            self.sv["bars_in_pullback"]   = i - self.sv["peak_bar_idx"]
-            imp_vol = self.sv["_impulse_bar_vol"]
-            pb_vol  = self.sv["_pullback_vol_sum"]
-            self.sv["pullback_vol_ratio"] = (pb_vol / imp_vol) if imp_vol and imp_vol > 0 else None
-            if self.MAX_PULLBACK_VOL > 0 and self.sv["pullback_vol_ratio"] is not None:
-                if self.sv["pullback_vol_ratio"] >= self.MAX_PULLBACK_VOL:
-                    self.state = WAIT_BREAK
-                    self._reset_sv()
-                    return None
-            self.state = WAIT_RETEST
-        return None
-
-    def _handle_wait_retest(self, i: int, bar: Bar) -> Optional[Signal]:
-        if self.RETEST_MAX_BARS > 0 and (i - self.sv["peak_bar_idx"]) > self.RETEST_MAX_BARS:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
-
-        if bar.close > self.sv["impulse_high"] + self.STOP_BUFFER_MULT * self.sv["impulse_size"]:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
-
-        if bar.low < self.sv["pullback_low"]:
-            self.sv["pullback_low"] = bar.low
-
-        imp_high = self.sv["impulse_high"]
-        retest_threshold = imp_high * self.RETEST_PCT
-        if bar.high < imp_high - retest_threshold:
-            return None
-
-        # Reject punch-through
-        if bar.high > imp_high:
-            return None
-
-        self.sv["retest_bar_idx"]      = i
-        self.sv["retest_wick_extension"] = max(bar.high - imp_high, 0.0) / imp_high
-        self.state = WAIT_FAILURE
-        return None
-
-    def _handle_wait_failure(self, i: int, bar: Bar) -> Optional[Signal]:
-        if bar.close > self.sv["impulse_high"] + self.STOP_BUFFER_MULT * self.sv["impulse_size"]:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
-
-        if self.RETEST_MAX_BARS > 0 and (i - self.sv["peak_bar_idx"]) > self.RETEST_MAX_BARS:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
-
-        if bar.close >= bar.open:
-            if i - self.sv["retest_bar_idx"] > 2:
-                self.state = WAIT_BREAK
-                self._reset_sv()
-            return None
-
-        # Failure candle confirmed
-        _fc_range = bar.high - bar.low
-        body_pct  = (bar.open - bar.close) / _fc_range if _fc_range > 0 else None
-
-        if self.MIN_FAILURE_BODY_PCT > 0 and body_pct is not None:
-            if body_pct < self.MIN_FAILURE_BODY_PCT:
-                self.state = WAIT_BREAK
-                self._reset_sv()
+            if bar_close <= rolling_high:
                 return None
 
-        stop_price = self.sv["impulse_high"] + self.STOP_BUFFER_MULT * self.sv["impulse_size"]
-        entry_vwap = self._vwaps[i]
+            imp_low = floor_for_walk if floor_for_walk is not None else rolling_low
+            lows_arr = [self._bars[j][2] for j in range(i)]
+            imp_low = _backwalk_impulse_low(lows_arr, i, floor_low=imp_low,
+                                            max_back=MAX_IMPULSE_BACK,
+                                            stop_no_new_low=NO_NEW_LOW_STOP) or rolling_low
 
-        if self.TP_MODE == "vwap":
-            tp_raw = None  # resolved at fill
-        elif self.TP_MODE == "midpoint":
-            tp_raw = self.sv["impulse_high"] - 0.5 * self.sv["impulse_size"]
-        else:
-            tp_raw = self.sv["impulse_high"] - self.TP_FIXED_MULT * self.sv["impulse_size"]
+            imp_high = bar_high
+            imp_size = imp_high - imp_low
+            _atr = bar_atr or 0.0
+            if _atr > 0 and imp_size < ATR_MULT * _atr:
+                return None
+            if SIZE_PCT_MIN > 0 and imp_high > 0:
+                if imp_size / imp_high < SIZE_PCT_MIN:
+                    return None
+            bar_range = bar_high - bar_low
+            if BK_MIN > 0 and _atr > 0 and bar_range < BK_MIN * _atr:
+                return None
+            if IBS_MIN > 0 and bar_range > 0:
+                ibs = (bar_close - bar_low) / bar_range
+                if ibs < IBS_MIN:
+                    return None
 
-        self.sv["failure_candle_body_pct"] = body_pct
-        self.sv["failure_candle_close_vs_vwap"] = (
-            (bar.close - entry_vwap) / entry_vwap if entry_vwap > 0 else None
-        )
-        self.sv["stop"] = stop_price
-        self.sv["tp"]   = tp_raw
-        self.state = WAIT_FILL
-        return None
+            consec = 1
+            for k in range(i - 1, max(i - lookback - 1, 0), -1):
+                if self._bars[k][3] < self._bars[k + 1][3]:
+                    consec += 1
+                else:
+                    break
+            if IMPULSE_MIN_B > 1 and consec < IMPULSE_MIN_B:
+                return None
 
-    def _handle_wait_fill(self, i: int, bar: Bar) -> Optional[Signal]:
-        if bar.time == "15:59":
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
-        if bar.time < self.ENTRY_TIME_START or bar.time > self.ENTRY_TIME_END:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
+            sv["impulse_low"]   = imp_low
+            sv["impulse_high"]  = imp_high
+            sv["impulse_size"]  = imp_size
+            sv["peak_time"]     = bar_label
+            sv["peak_bar_idx"]  = i
+            sv["breakout_bar_idx"] = i
+            sv["breakout_ibs"]  = (bar_close - bar_low) / bar_range if bar_range > 0 else None
+            sv["impulse_atr_ratio"]      = imp_size / _atr if _atr > 0 else None
+            sv["impulse_size_pct"]       = imp_size / imp_high if imp_high > 0 else None
+            sv["breakout_bar_range_atr"] = bar_range / _atr if _atr > 0 else None
+            sv["impulse_consec_bars"]    = consec
+            _med = vol_med
+            sv["impulse_bar_vol_vs_median"] = (bar_vol / _med
+                                               if _med and not np.isnan(_med) and _med > 0 else None)
+            sv["_impulse_bar_vol"]  = bar_vol
+            sv["_pullback_vol_sum"] = 0.0
+            self._state = _BUILD_PEAK
 
-        slip_entry = bar.open * self.SLIPPAGE_PCT
-        entry_fill = bar.open - slip_entry   # short: worsened downward
+        # ── BUILD_PEAK ────────────────────────────────────────────────────────
+        elif self._state == _BUILD_PEAK:
+            if bar_high > sv["impulse_high"]:
+                sv["impulse_high"] = bar_high
+                sv["impulse_size"] = sv["impulse_high"] - sv["impulse_low"]
+                sv["peak_time"]    = bar_label
+                sv["peak_bar_idx"] = i
+            elif bar_close < bar_open:
+                if bar_label >= PEAK_CUTOFF:
+                    self._state = _WAIT_BREAK
+                    self._sv    = _reset_sv()
+                    return None
+                sv["pullback_low"] = bar_low
+                self._state = _TRACK_PULLBACK
 
-        stop_raw   = self.sv["stop"]
-        slip_stop  = stop_raw * self.SLIPPAGE_PCT
-        stop_fill  = stop_raw + slip_stop    # stop exit: worsened upward
+        # ── TRACK_PULLBACK ────────────────────────────────────────────────────
+        elif self._state == _TRACK_PULLBACK:
+            if bar_high > sv["impulse_high"]:
+                sv["impulse_high"]  = bar_high
+                sv["impulse_size"]  = sv["impulse_high"] - sv["impulse_low"]
+                sv["peak_time"]     = bar_label
+                sv["peak_bar_idx"]  = i
+                sv["pullback_low"]  = None
+                sv["_pullback_vol_sum"] = 0.0
+                self._state = _BUILD_PEAK
+                return None
 
-        if self.TP_MODE == "vwap":
-            tp_raw = self._vwaps[i]
-        else:
-            tp_raw = self.sv["tp"]
+            sv["pullback_low"] = min(sv["pullback_low"], bar_low)
+            sv["_pullback_vol_sum"] += bar_vol
+            retrace = sv["impulse_high"] - sv["pullback_low"]
+            ratio   = retrace / sv["impulse_size"] if sv["impulse_size"] > 0 else 0
 
-        if tp_raw is None:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
+            if ratio > DR_MAX:
+                self._state = _WAIT_BREAK
+                self._sv    = _reset_sv()
+                return None
 
-        slip_tp  = tp_raw * self.SLIPPAGE_PCT
-        tp_fill  = tp_raw + slip_tp          # TP exit: worsened upward
+            if ratio >= DR_MIN:
+                sv["deep_retrace_ratio"] = ratio
+                sv["bars_in_pullback"]   = i - sv["peak_bar_idx"]
+                sv["pullback_vol_ratio"] = (sv["_pullback_vol_sum"] / sv["_impulse_bar_vol"]
+                                            if sv["_impulse_bar_vol"] and sv["_impulse_bar_vol"] > 0 else None)
+                if PB_VOL_MAX > 0 and sv["pullback_vol_ratio"] is not None:
+                    if sv["pullback_vol_ratio"] >= PB_VOL_MAX:
+                        self._state = _WAIT_BREAK
+                        self._sv    = _reset_sv()
+                        return None
+                self._state = _WAIT_RETEST
 
-        # Validity checks
-        if entry_fill <= tp_fill:    return None
-        if entry_fill >= stop_fill:  return None
+        # ── WAIT_RETEST ───────────────────────────────────────────────────────
+        elif self._state == _WAIT_RETEST:
+            if RETEST_MAX_B > 0 and (i - sv["peak_bar_idx"]) > RETEST_MAX_B:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+            if bar_close > sv["impulse_high"] + STOP_BUF * sv["impulse_size"]:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+            if bar_low < sv["pullback_low"]:
+                sv["pullback_low"] = bar_low
 
-        R_at_entry = stop_fill - entry_fill
-        if R_at_entry < entry_fill * self.MIN_R_PCT:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
+            thresh = sv["impulse_high"] * RETEST_PCT
+            if bar_high >= sv["impulse_high"] - thresh:
+                if bar_high > sv["impulse_high"]:
+                    return None  # wick punch-through — skip, keep watching
+                sv["retest_bar_idx"] = i
+                sv["retest_wick_extension"] = max(bar_high - sv["impulse_high"], 0.0) / sv["impulse_high"]
+                _med = vol_med
+                sv["retest_bar_vol_vs_median"] = (bar_vol / _med
+                                                  if _med and not np.isnan(_med) and _med > 0 else None)
+                self._state = _WAIT_FAILURE
 
-        if tp_fill >= entry_fill:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
+        # ── WAIT_FAILURE ──────────────────────────────────────────────────────
+        elif self._state == _WAIT_FAILURE:
+            if bar_close > sv["impulse_high"] + STOP_BUF * sv["impulse_size"]:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+            if RETEST_MAX_B > 0 and (i - sv["peak_bar_idx"]) > RETEST_MAX_B:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
 
-        # Same-bar exits (gap market): skip — orchestrator cannot fill+exit same bar on live
-        if bar.high >= stop_fill or bar.low <= tp_fill:
-            self.state = WAIT_BREAK
-            self._reset_sv()
-            return None
+            if bar_close < bar_open:
+                stop_price = sv["impulse_high"] + STOP_BUF * sv["impulse_size"]
+                _fc_range  = bar_high - bar_low
+                sv["failure_candle_body_pct"] = (
+                    (bar_open - bar_close) / _fc_range if _fc_range > 0 else None
+                )
+                if FAIL_BODY_MIN > 0 and sv["failure_candle_body_pct"] is not None:
+                    if sv["failure_candle_body_pct"] < FAIL_BODY_MIN:
+                        self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
 
-        self.state = DONE
-        return Signal(
-            strategy_id  = self.strategy_id,
-            symbol       = self.symbol,
-            direction    = "short",
-            entry_price  = round(entry_fill, 4),
-            stop         = round(stop_fill, 4),
-            tp           = round(tp_fill, 4),
-            R            = round(R_at_entry, 6),
-            bar_time     = bar.time,
-            session_date = bar.date,
-            meta={
-                "impulse_high":          self.sv["impulse_high"],
-                "impulse_low":           self.sv["impulse_low"],
-                "deep_retrace_ratio":    self.sv["deep_retrace_ratio"],
-                "failure_candle_body_pct": self.sv["failure_candle_body_pct"],
-                "pullback_vol_ratio":    self.sv["pullback_vol_ratio"],
-            }
-        )
-
-    def _backwalk(self, i: int, floor_low: float,
-                  max_back: int = MAX_IMPULSE_BACK,
-                  stop_no_new_low: int = NO_NEW_LOW_STOP) -> float:
-        j = i - 1
-        if j < 0:
-            return floor_low
-        imp_low   = floor_low
-        no_new_low = 0
-        steps      = 0
-        while j - 1 >= 0 and steps < max_back and no_new_low < stop_no_new_low:
-            j     -= 1
-            steps += 1
-            low_j  = self._lows[j]
-            if low_j < imp_low:
-                imp_low    = low_j
-                no_new_low = 0
+                sv["failure_candle_close_vs_vwap"] = (
+                    (bar_close - vwap_now) / vwap_now if vwap_now > 0 else None
+                )
+                sv["stop"] = stop_price
+                if TP_MODE != "vwap":
+                    sv["tp"] = sv["impulse_high"] - TP_MULT * sv["impulse_size"]
+                else:
+                    sv["tp"] = None  # resolved on fill bar
+                self._state = _WAIT_FILL
             else:
-                no_new_low += 1
-        return imp_low
+                if sv["retest_bar_idx"] is not None and i - sv["retest_bar_idx"] > 2:
+                    self._state = _WAIT_BREAK; self._sv = _reset_sv()
+
+        # ── WAIT_FILL ─────────────────────────────────────────────────────────
+        elif self._state == _WAIT_FILL:
+            if bar_label == "15:59":
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+            if bar_label < ENTRY_T_START or bar_label > ENTRY_T_END:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+
+            _slip_e  = bar_open * SLIP
+            entry_fill = bar_open - _slip_e  # short: sell lower
+
+            stop_raw  = sv["stop"]
+            stop_fill = stop_raw + stop_raw * SLIP
+
+            if TP_MODE == "vwap":
+                tp_raw = vwap_now
+            else:
+                tp_raw = sv["tp"]
+            tp_fill = tp_raw + tp_raw * SLIP  # short TP: buy back higher
+
+            if entry_fill <= tp_fill:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+            if entry_fill >= stop_fill:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+
+            R_at_entry = stop_fill - entry_fill
+            if R_at_entry < entry_fill * MIN_R:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+            if tp_fill >= entry_fill:
+                self._state = _WAIT_BREAK; self._sv = _reset_sv(); return None
+
+            _vwap_fill = vwap_now
+            _evwap_pct = (entry_fill - _vwap_fill) / _vwap_fill * 100 if _vwap_fill > 0 else None
+
+            from models import Signal
+            return Signal(
+                strategy_id  = self.strategy_id,
+                symbol       = self.symbol,
+                direction    = "short",
+                entry_price  = entry_fill,
+                stop         = stop_fill,
+                tp           = tp_fill,
+                R            = R_at_entry,
+                session_date = str(ctx.session_date),
+                bar_time     = bar.time,
+                meta = {
+                    "impulse_low":                sv["impulse_low"],
+                    "impulse_high":               sv["impulse_high"],
+                    "impulse_size":               sv["impulse_size"],
+                    "peak_time":                  sv["peak_time"],
+                    "impulse_atr_ratio":          sv["impulse_atr_ratio"],
+                    "impulse_size_pct":           round(sv["impulse_size_pct"] * 100, 4) if sv["impulse_size_pct"] else None,
+                    "breakout_bar_range_atr":     sv["breakout_bar_range_atr"],
+                    "impulse_consec_bars":        sv["impulse_consec_bars"],
+                    "breakout_ibs":               sv["breakout_ibs"],
+                    "deep_retrace_ratio":         sv["deep_retrace_ratio"],
+                    "bars_in_pullback":           sv["bars_in_pullback"],
+                    "retest_wick_extension":      round(sv["retest_wick_extension"] * 100, 4) if sv["retest_wick_extension"] is not None else None,
+                    "failure_candle_body_pct":    round(sv["failure_candle_body_pct"] * 100, 4) if sv["failure_candle_body_pct"] is not None else None,
+                    "failure_candle_close_vs_vwap": round(sv["failure_candle_close_vs_vwap"] * 100, 4) if sv["failure_candle_close_vs_vwap"] is not None else None,
+                    "vwap_at_entry":              round(_vwap_fill, 4),
+                    "entry_vs_vwap_pct":          round(_evwap_pct, 4) if _evwap_pct is not None else None,
+                    "session_atr":                round(bar_atr, 4) if bar_atr else None,
+                    "is_same_bar_fill":           False,
+                    "impulse_bar_vol_vs_median":  sv["impulse_bar_vol_vs_median"],
+                    "pullback_vol_ratio":         sv["pullback_vol_ratio"],
+                    "retest_bar_vol_vs_median":   sv["retest_bar_vol_vs_median"],
+                },
+            )
+
+        return None
