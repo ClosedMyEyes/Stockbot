@@ -109,6 +109,11 @@ class Orchestrator:
         self._strat_transition_bar: Dict[tuple, int] = {}
         self._STATE_TIMEOUT_BARS = 90
 
+        # Last known bar close per symbol — used by EOD safety timer for realistic exit price
+        self._last_close: Dict[str, float] = {}
+        # Guard against _post_market being called twice (timer + new session)
+        self._post_market_done: bool = False
+
     # =========================================================================
     # MAIN BAR CALLBACK
     # =========================================================================
@@ -135,6 +140,9 @@ class Orchestrator:
 
         ctx.update_vwap(bar)
         ctx.update_extremes(bar)
+
+        # Track last known close price for every symbol (used by EOD safety timer)
+        self._last_close[bar.symbol] = bar.close
 
         # [R3] Fill verification — check 2 bars after entry
         self._run_fill_verification(bar)
@@ -392,6 +400,42 @@ class Orchestrator:
         else:
             self._losses += 1
 
+    def _force_close(self, trade_id: str, pos: OpenPosition,
+                     exit_price: float, reason: str):
+        """
+        Full close path without a Bar object — used by EOD safety timer and
+        any other caller that doesn't have a live bar reference.
+        Fires executor.send_exit, writes ll.log_trade, updates state.json.
+        """
+        result_r = self.risk.close_position(trade_id, exit_price, reason)
+        if result_r is None:
+            return
+
+        pnl_dollars = result_r * pos.R
+
+        for strat in self.strategies.get(pos.symbol, []):
+            if strat.strategy_id == pos.strategy_id and strat._in_trade:
+                strat.on_exit(result_r, reason)
+                break
+
+        bars_held = (self._bar_counters.get(pos.symbol, 0)
+                     - self._position_entry_bar.get(trade_id, 0))
+
+        self.executor.send_exit(pos, exit_price, reason)
+        ll.log_trade(
+            pos=pos, exit_price=exit_price, exit_time="16:00",
+            exit_reason=reason, result_r=result_r, bars_to_exit=bars_held,
+            meta=self._positions_meta.pop(trade_id, {}),
+        )
+        self._position_entry_bar.pop(trade_id, None)
+        self._pending_verify.pop(trade_id, None)
+        self.state.on_position_close(trade_id, result_r, pnl_dollars)
+
+        if result_r > 0:
+            self._wins += 1
+        else:
+            self._losses += 1
+
     # =========================================================================
     # EOD [R5]
     # =========================================================================
@@ -433,22 +477,20 @@ class Orchestrator:
         def _eod_safety():
             log.info("EOD SAFETY TIMER fired — forcing close of any remaining open positions")
             for trade_id, pos in list(self.risk.open_positions.items()):
+                # Use last known bar close for this symbol; fall back to entry_price
+                # (0R) only if we genuinely have no price data at all.
+                exit_price = self._last_close.get(pos.symbol, pos.entry_price)
                 log.warning(
                     f"EOD safety close: {pos.strategy_id}({pos.symbol}) "
-                    f"trade_id={trade_id} — no 15:59 bar received"
+                    f"trade_id={trade_id}  exit_price={exit_price:.4f}"
                 )
-                result_r = self.risk.close_position(trade_id, pos.entry_price, "EOD safety close")
-                if result_r is None:
-                    continue
-                for strat in self.strategies.get(pos.symbol, []):
-                    if strat.strategy_id == pos.strategy_id and strat._in_trade:
-                        strat.on_exit(result_r, "EOD safety close")
-                        break
-                self.state.on_position_close(trade_id, result_r, result_r * pos.R)
-                self._positions_meta.pop(trade_id, None)
-                self._pending_verify.pop(trade_id, None)
+                # Call the full close path — fires executor.send_exit (SignalStack
+                # webhook), writes ll.log_trade (CSV), updates state.json.
+                self._force_close(trade_id, pos, exit_price, "EOD safety close")
 
-            self._post_market(self._session_date)
+            if not self._post_market_done:
+                self._post_market_done = True
+                self._post_market(self._session_date)
 
         self._eod_timer = threading.Timer(delay, _eod_safety)
         self._eod_timer.daemon = True
@@ -523,6 +565,7 @@ class Orchestrator:
 
         self.risk.reset_day(session_date)
         self.state.clear_session()
+        self._post_market_done = False  # reset guard for new session
 
         # [R5] Schedule EOD safety timer
         self._schedule_eod_timer(session_date)
@@ -536,6 +579,10 @@ class Orchestrator:
                     log.error(f"reset_session error [{strat}]: {e}", exc_info=True)
 
     def _post_market(self, session_date: str):
+        if self._post_market_done:
+            return  # safety timer already ran this — don't double-log
+        self._post_market_done = True
+
         if self._eod_timer is not None:
             self._eod_timer.cancel()
             self._eod_timer = None

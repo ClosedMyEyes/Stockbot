@@ -51,6 +51,16 @@ from typing import Dict, Optional, Tuple
 
 log = logging.getLogger("orchestrator.state")
 
+def _json_default(obj):
+    """
+    JSON serializer for types not handled by default.
+    - set / frozenset → sorted list (restorable, readable)
+    - anything else → str fallback (same as before, but sets are now caught first)
+    """
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj)
+    return str(obj)
+
 STATE_FILE = os.path.join("logs", "state.json")
 
 
@@ -69,7 +79,7 @@ def _atomic_write(path: str, data: dict) -> None:
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".state_tmp_")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+            json.dump(data, f, indent=2, default=_json_default)
         os.replace(tmp_path, path)  # atomic on POSIX; best-effort on Windows
     except Exception:
         try:

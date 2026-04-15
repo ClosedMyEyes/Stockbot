@@ -111,6 +111,7 @@ class GapFillBaseStrategy(BaseStrategy):
         MAX_BARS      = p.get("max_bars_to_entry", 0)
         MIN_FILL      = p.get("min_gap_fill_at_entry", 0.2)
         GAP_VOL_MIN   = p.get("gap_vol_ratio_min", 0.0)
+        GAP_VOL_MAX   = p.get("gap_vol_ratio_max", 0.0)   # 0 = off (same convention as scripts)
         GAP_ATR_MIN   = p.get("gap_atr_ratio_min", 0.0)
         GAP_ATR_MAX   = p.get("gap_atr_ratio_max", 0.0)
         DIRECTION     = p.get("direction", "short")
@@ -159,6 +160,9 @@ class GapFillBaseStrategy(BaseStrategy):
                 if fb_ratio is None or (isinstance(fb_ratio, float) and np.isnan(fb_ratio)):
                     self._session_active = False; return None
                 if fb_ratio < GAP_VOL_MIN:
+                    self._session_active = False; return None
+            if GAP_VOL_MAX > 0 and fb_ratio is not None and not (isinstance(fb_ratio, float) and np.isnan(fb_ratio)):
+                if fb_ratio > GAP_VOL_MAX:
                     self._session_active = False; return None
 
             # Gap ATR ratio filter
