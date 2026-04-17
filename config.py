@@ -23,10 +23,34 @@ SIGNALSTACK_API_KEY     = "YOUR_SIGNALSTACK_API_KEY"   # set via env var in prod
 # =============================================================================
 # RISK PARAMETERS
 # =============================================================================
-RISK_PER_TRADE_DOLLARS  = 100.0    # fixed dollar risk per trade (1R)
-MAX_SIMULTANEOUS_POSITIONS = 3     # max open trades across all strategies/symbols
-DAILY_LOSS_LIMIT_DOLLARS   = 300.0 # halt new signals if daily P&L drops below this
-MAX_POSITIONS_PER_SYMBOL   = 1     # if two strategies want the same symbol, first wins
+MAX_SIMULTANEOUS_POSITIONS  = 6       # max open trades across all strategies at once
+DAILY_LOSS_LIMIT_DOLLARS    = 1000.0  # portfolio-level hard stop (sum of all per-strategy DDs)
+MAX_POSITIONS_PER_SYMBOL    = 1       # only one strategy may hold a given symbol at a time
+
+# Per-strategy risk settings.
+#   risk_per_trade : dollar risk per trade (1R)
+#   max_dd         : daily drawdown limit for this strategy; hitting it halts
+#                    that strategy for the rest of the session (others keep running)
+STRATEGY_RISK: Dict[str, dict] = {
+    "gf_small_multi": {"risk_per_trade": 125.0, "max_dd":  750.0},
+    "gap_fill_big":   {"risk_per_trade": 245.0, "max_dd":  1000.0},
+    "gap_fill_large": {"risk_per_trade":  48.0, "max_dd":  250.0},
+    "impulse_short":  {"risk_per_trade":  42.0, "max_dd":  225.0},
+    "gap_fill_small": {"risk_per_trade":  67.0, "max_dd":  400.0},
+    "orb_short":      {"risk_per_trade":  20.0, "max_dd":  100.0},
+}
+
+# Same-symbol conflict priority (index 0 = highest priority).
+# When two strategies want the same symbol on the same bar, the one with
+# the lower index wins the slot. Existing open positions are never preempted.
+STRATEGY_PRIORITY: List[str] = [
+    "gf_small_multi",
+    "gap_fill_big",
+    "gap_fill_large",
+    "impulse_short",
+    "gap_fill_small",
+    "orb_short",
+]
 
 # =============================================================================
 # SESSION TIMING

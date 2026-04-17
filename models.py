@@ -1,5 +1,8 @@
 """
 models.py — Shared data models across the orchestrator.
+
+NOTE: SessionContext lives in data/feed.py (owns its own context class).
+      Import it from there, not here.
 """
 
 from dataclasses import dataclass, field
@@ -62,40 +65,3 @@ class Bar:
     @property
     def datetime_str(self) -> str:
         return f"{self.date} {self.time}"
-
-
-@dataclass
-class SessionContext:
-    """
-    Pre-computed session-level context fed to every strategy on each bar.
-    Populated by the data layer before the bar loop starts.
-    """
-    symbol:            str
-    session_date:      str
-    prior_close:       Optional[float] = None
-    today_open:        Optional[float] = None
-    daily_atr:         Optional[float] = None
-    vol_median:        Optional[float] = None    # rolling 20-day median daily volume
-    vol_regime_ratio:  Optional[float] = None    # yesterday_range / 20-day mean range
-    first_bar_vol_ratio: Optional[float] = None  # first bar vol / rolling median first-bar vol
-    gap_pct:           Optional[float] = None    # (today_open - prior_close) / prior_close
-    gap_size:          Optional[float] = None    # abs(today_open - prior_close)
-
-    # Updated bar by bar
-    session_high:      float = 0.0
-    session_low:       float = 9999999.0
-    vwap:              float = 0.0
-    cum_pv:            float = 0.0
-    cum_v:             float = 0.0
-    bar_index:         int   = 0
-
-    def update_vwap(self, bar: Bar):
-        tp = (bar.high + bar.low + bar.close) / 3.0
-        self.cum_pv += tp * bar.volume
-        self.cum_v  += bar.volume
-        self.vwap    = self.cum_pv / self.cum_v if self.cum_v > 0 else bar.close
-
-    def update_extremes(self, bar: Bar):
-        self.session_high = max(self.session_high, bar.high)
-        self.session_low  = min(self.session_low,  bar.low)
-        self.bar_index   += 1

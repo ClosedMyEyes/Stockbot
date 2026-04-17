@@ -39,11 +39,11 @@ logging.basicConfig(
 )
 
 from . import config
-from .models import Bar, SessionContext, OpenPosition, Signal
+from .models import Bar, OpenPosition, Signal
 from .strategies import build_strategy, BaseStrategy
 from .risk.risk_manager import RiskManager
 from .execution import get_executor
-from .data.feed import IBKRFeed, SessionContextBuilder
+from .data.feed import IBKRFeed, SessionContextBuilder, SessionContext
 from . import logging_layer as ll
 from .state_manager import StateManager
 
@@ -73,6 +73,12 @@ class Orchestrator:
                 log.info(f"Registered: {strat_id}({sym})")
 
         self.all_symbols: Set[str] = set(self.strategies.keys())
+
+        # Priority lookup for same-symbol conflict resolution (lower index = higher priority)
+        self._priority: Dict[str, int] = {
+            strat_id: idx
+            for idx, strat_id in enumerate(config.STRATEGY_PRIORITY)
+        }
 
         # Session tracking
         self._session_date: str  = ""
@@ -138,9 +144,6 @@ class Orchestrator:
             ctx = self.ctx_builder.get_context(bar.symbol, bar.date)
             self._session_ctxs[bar.symbol] = ctx
 
-        ctx.update_vwap(bar)
-        ctx.update_extremes(bar)
-
         # Track last known close price for every symbol (used by EOD safety timer)
         self._last_close[bar.symbol] = bar.close
 
@@ -161,7 +164,11 @@ class Orchestrator:
         if not self._session_open:
             return
 
-        for strat in self.strategies.get(bar.symbol, []):
+        strats_for_symbol = sorted(
+            self.strategies.get(bar.symbol, []),
+            key=lambda s: self._priority.get(s.strategy_id, 999),
+        )
+        for strat in strats_for_symbol:
             if strat._in_trade:
                 continue
 
@@ -721,9 +728,11 @@ class Orchestrator:
             f"ghost_closed={ghosts} orphans={orphans}"
         )
         # Restore daily stats from state
-        self.risk._daily_r_total    = saved.get("daily_r_total", 0.0)
-        self.risk._daily_pnl_dollars = saved.get("daily_pnl_dollars", 0.0)
-        self.risk._halted           = saved.get("halted", False)
+        self.risk.restore_session_stats(
+            daily_r  = saved.get("daily_r_total", 0.0),
+            daily_pnl= saved.get("daily_pnl_dollars", 0.0),
+            halted   = saved.get("halted", False),
+        )
 
         return restored > 0
 

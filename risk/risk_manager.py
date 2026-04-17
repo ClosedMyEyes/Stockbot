@@ -11,7 +11,8 @@ Responsibilities:
 
 import logging
 import uuid
-from typing import Dict, List, Optional
+from collections import defaultdict
+from typing import Dict, List, Optional, Set
 from ..models import Signal, OpenPosition
 from .. import config
 
@@ -21,21 +22,27 @@ log = logging.getLogger("risk")
 class RiskManager:
 
     def __init__(self):
-        self.open_positions: Dict[str, OpenPosition] = {}   # trade_id → OpenPosition
+        self.open_positions:    Dict[str, OpenPosition] = {}
         self.daily_pnl_dollars: float = 0.0
         self.daily_r_total:     float = 0.0
-        self.halted:            bool  = False
+        self.halted:            bool  = False   # portfolio-level halt
         self._session_date:     str   = ""
+
+        # Per-strategy tracking
+        self._strategy_pnl:     Dict[str, float] = defaultdict(float)
+        self._halted_strategies: Set[str]        = set()
 
     # ── Session management ────────────────────────────────────────────────────
 
     def reset_day(self, session_date: str):
-        self.daily_pnl_dollars = 0.0
-        self.daily_r_total     = 0.0
-        self.halted            = False
-        self._session_date     = session_date
+        self.daily_pnl_dollars  = 0.0
+        self.daily_r_total      = 0.0
+        self.halted             = False
+        self._session_date      = session_date
+        self._strategy_pnl      = defaultdict(float)
+        self._halted_strategies = set()
         # Note: open_positions are NOT cleared here — EOD close handles that.
-        log.info(f"[{session_date}] Risk manager reset. Halt cleared.")
+        log.info(f"[{session_date}] Risk manager reset. All halts cleared.")
 
     # ── Main gate ─────────────────────────────────────────────────────────────
 
@@ -43,16 +50,23 @@ class RiskManager:
         """
         Run all risk checks against a signal.
         Returns an OpenPosition ready to register, or None if rejected.
-        Logs the rejection reason.
         """
+        strat_id = signal.strategy_id
+
+        # Portfolio-level halt
         if self.halted:
-            log.warning(f"REJECTED [{signal.strategy_id} {signal.symbol}] — daily loss limit HALT")
+            log.warning(f"REJECTED [{strat_id} {signal.symbol}] — portfolio daily loss HALT")
+            return None
+
+        # Per-strategy halt
+        if strat_id in self._halted_strategies:
+            log.warning(f"REJECTED [{strat_id} {signal.symbol}] — strategy daily DD HALT")
             return None
 
         # Max simultaneous positions
         if len(self.open_positions) >= config.MAX_SIMULTANEOUS_POSITIONS:
             log.warning(
-                f"REJECTED [{signal.strategy_id} {signal.symbol}] — "
+                f"REJECTED [{strat_id} {signal.symbol}] — "
                 f"max positions ({config.MAX_SIMULTANEOUS_POSITIONS}) reached"
             )
             return None
@@ -61,24 +75,27 @@ class RiskManager:
         conflict = self._same_symbol_conflict(signal.symbol)
         if conflict:
             log.warning(
-                f"CONFLICT [{signal.strategy_id} {signal.symbol}] — "
-                f"already held by {conflict.strategy_id} (first-signal wins)"
+                f"CONFLICT [{strat_id} {signal.symbol}] — "
+                f"already held by {conflict.strategy_id} (priority ordering)"
             )
             return None
 
-        # Size trade
+        # Per-strategy risk sizing
+        strat_risk = config.STRATEGY_RISK.get(strat_id, {})
+        risk_per_trade = strat_risk.get("risk_per_trade", 100.0)
+
         risk_per_share = abs(signal.entry_price - signal.stop)
         if risk_per_share <= 0:
-            log.error(f"REJECTED [{signal.strategy_id} {signal.symbol}] — zero R")
+            log.error(f"REJECTED [{strat_id} {signal.symbol}] — zero R")
             return None
 
-        shares = max(1, int(config.RISK_PER_TRADE_DOLLARS / risk_per_share))
+        shares    = max(1, int(risk_per_trade / risk_per_share))
         R_dollars = shares * risk_per_share
 
         trade_id = str(uuid.uuid4())[:8]
         pos = OpenPosition(
             trade_id     = trade_id,
-            strategy_id  = signal.strategy_id,
+            strategy_id  = strat_id,
             symbol       = signal.symbol,
             direction    = signal.direction,
             entry_price  = signal.entry_price,
@@ -90,10 +107,10 @@ class RiskManager:
             session_date = signal.session_date,
         )
         log.info(
-            f"APPROVED [{signal.strategy_id} {signal.symbol}] "
+            f"APPROVED [{strat_id} {signal.symbol}] "
             f"{signal.direction.upper()} {shares}sh @ {signal.entry_price:.2f} "
             f"stop={signal.stop:.2f}  tp={signal.tp:.2f}  "
-            f"R=${R_dollars:.2f} (${config.RISK_PER_TRADE_DOLLARS:.0f} target)"
+            f"R=${R_dollars:.2f} (target ${risk_per_trade:.0f})"
         )
         return pos
 
@@ -101,11 +118,34 @@ class RiskManager:
         """Call after execution confirms the fill."""
         self.open_positions[pos.trade_id] = pos
 
+    def restore_position(self, pos: OpenPosition):
+        """
+        Re-register a position after crash recovery / reconnect reconciliation.
+        Does NOT affect daily P&L stats (those are restored separately via
+        restore_session_stats). Does NOT send any execution orders.
+        """
+        self.open_positions[pos.trade_id] = pos
+        log.info(f"RESTORED position: {pos.strategy_id}({pos.symbol}) "
+                 f"trade_id={pos.trade_id}")
+
+    def restore_session_stats(self, daily_r: float, daily_pnl: float,
+                               halted: bool) -> None:
+        """
+        Restore daily P&L stats from state.json on startup.
+        Note: per-strategy P&L is not persisted in state.json (positions only),
+        so we restore the portfolio totals and re-derive halts from STRATEGY_RISK.
+        """
+        self.daily_r_total     = daily_r
+        self.daily_pnl_dollars = daily_pnl
+        self.halted            = halted
+        log.info(f"Restored session stats: R={daily_r:+.4f}  "
+                 f"P&L=${daily_pnl:+.2f}  halted={halted}")
+
     def close_position(self, trade_id: str, exit_price: float,
                         exit_reason: str) -> Optional[float]:
         """
         Close an open position. Returns result_r or None if not found.
-        Updates daily P&L.
+        Updates daily P&L and checks per-strategy / portfolio DD limits.
         """
         pos = self.open_positions.pop(trade_id, None)
         if pos is None:
@@ -116,21 +156,34 @@ class RiskManager:
         result_r = (exit_price - pos.entry_price) * dir_mult / abs(pos.entry_price - pos.stop)
         pnl      = (exit_price - pos.entry_price) * dir_mult * pos.shares
 
-        self.daily_pnl_dollars += pnl
-        self.daily_r_total     += result_r
+        self.daily_pnl_dollars           += pnl
+        self.daily_r_total               += result_r
+        self._strategy_pnl[pos.strategy_id] += pnl
 
         log.info(
             f"CLOSED [{pos.strategy_id} {pos.symbol}] "
             f"exit={exit_price:.2f}  result={result_r:+.2f}R  "
-            f"P&L=${pnl:+.2f}  daily_P&L=${self.daily_pnl_dollars:+.2f}"
+            f"P&L=${pnl:+.2f}  strategy_P&L=${self._strategy_pnl[pos.strategy_id]:+.2f}  "
+            f"daily_P&L=${self.daily_pnl_dollars:+.2f}"
         )
 
-        # Check daily loss limit
+        # Per-strategy DD halt
+        strat_max_dd = config.STRATEGY_RISK.get(pos.strategy_id, {}).get("max_dd", None)
+        if strat_max_dd and self._strategy_pnl[pos.strategy_id] <= -abs(strat_max_dd):
+            self._halted_strategies.add(pos.strategy_id)
+            log.warning(
+                f"STRATEGY HALT [{pos.strategy_id}] — "
+                f"daily DD ${self._strategy_pnl[pos.strategy_id]:.2f} hit "
+                f"limit -${strat_max_dd:.0f}. Strategy halted for session."
+            )
+
+        # Portfolio-level halt
         if self.daily_pnl_dollars <= -abs(config.DAILY_LOSS_LIMIT_DOLLARS):
             self.halted = True
             log.warning(
-                f"DAILY LOSS LIMIT HIT — ${self.daily_pnl_dollars:.2f}. "
-                f"No new signals for the session."
+                f"PORTFOLIO HALT — daily P&L ${self.daily_pnl_dollars:.2f} "
+                f"hit limit -${config.DAILY_LOSS_LIMIT_DOLLARS:.0f}. "
+                f"All strategies halted for session."
             )
 
         return result_r
@@ -152,6 +205,8 @@ class RiskManager:
             "daily_pnl_dollars":   round(self.daily_pnl_dollars, 2),
             "daily_r_total":       round(self.daily_r_total, 4),
             "halted":              self.halted,
+            "halted_strategies":   sorted(self._halted_strategies),
+            "strategy_pnl":        {k: round(v, 2) for k, v in self._strategy_pnl.items()},
             "positions":           [
                 {
                     "trade_id":    p.trade_id,
