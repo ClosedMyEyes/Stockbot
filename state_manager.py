@@ -21,7 +21,7 @@ STATE FILE SCHEMA
       "entry_price": 45.23,
       "stop": 45.89,
       "tp": 43.10,
-      "R": 0.66,
+      "R_dollars": 0.66,
       "shares": 151,
       "entry_time": "10:43",
       "meta": { ... }
@@ -173,7 +173,7 @@ class StateManager:
             "entry_price": pos.entry_price,
             "stop":        pos.stop,
             "tp":          pos.tp,
-            "R":           pos.R,
+            "R_dollars":   pos.R_dollars,
             "shares":      pos.shares,
             "entry_time":  pos.entry_time if hasattr(pos, "entry_time") else "",
             "meta":        getattr(pos, "meta", {}),
@@ -242,20 +242,20 @@ class StateManager:
 
             if sym in ib_sym_qty:
                 # Case A — position still open at IBKR: restore it
-                from models import OpenPosition
+                from .models import OpenPosition
                 pos = OpenPosition(
-                    trade_id   = trade_id,
-                    strategy_id= snap["strategy_id"],
-                    symbol     = sym,
-                    direction  = snap["direction"],
-                    entry_price= snap["entry_price"],
-                    stop       = snap["stop"],
-                    tp         = snap["tp"],
-                    R          = snap["R"],
-                    shares     = snap["shares"],
+                    trade_id     = trade_id,
+                    strategy_id  = snap["strategy_id"],
+                    symbol       = sym,
+                    direction    = snap["direction"],
+                    entry_price  = snap["entry_price"],
+                    stop         = snap["stop"],
+                    tp           = snap["tp"],
+                    R_dollars    = snap.get("R_dollars", snap.get("R", 0.0)),
+                    shares       = snap["shares"],
+                    entry_time   = snap.get("entry_time", ""),
+                    session_date = session_date,
                 )
-                if hasattr(pos, "meta"):
-                    pos.meta = snap.get("meta", {})
                 risk_manager.restore_position(pos)
 
                 # Re-mark strategy as in_trade
@@ -278,7 +278,7 @@ class StateManager:
                                                    snap["entry_price"])
                 result_r   = self._estimate_result_r(snap, exit_price)
 
-                from logging_layer import log_trade as ll_log_trade
+                from .logging_layer import log_trade as ll_log_trade
                 class _FakePosForLog:
                     pass
                 fpos = _FakePosForLog()
@@ -289,7 +289,7 @@ class StateManager:
                 fpos.entry_price = snap["entry_price"]
                 fpos.stop        = snap["stop"]
                 fpos.tp          = snap["tp"]
-                fpos.R           = snap["R"]
+                fpos.R_dollars   = snap.get("R_dollars", snap.get("R", 0.0))
                 fpos.shares      = snap["shares"]
 
                 try:
@@ -352,7 +352,7 @@ class StateManager:
     def _estimate_result_r(snap: dict, exit_price: float) -> float:
         try:
             ep  = snap["entry_price"]
-            R   = snap["R"]
+            R   = snap["R_dollars"]
             d   = 1 if snap["direction"] == "long" else -1
             return round((exit_price - ep) * d / R, 4) if R > 0 else 0.0
         except Exception:

@@ -74,6 +74,7 @@ class GapFillBaseStrategy(BaseStrategy):
 
         # ── Intra-session trade tracking ──────────────────────────────────────
         self._state               = _WAIT_ENTRY
+        self._prev_state_for_timeout = 0
         self._session_high        = None
         self._session_low         = None
         self._bars_scanned        = 0
@@ -266,7 +267,7 @@ class GapFillBaseStrategy(BaseStrategy):
             self._gap_fill_entry = gap_fill_e
             self._state          = _IN_TRADE
 
-            from models import Signal
+            from ..models import Signal
             return Signal(
                 strategy_id  = self.strategy_id,
                 symbol       = self.symbol,

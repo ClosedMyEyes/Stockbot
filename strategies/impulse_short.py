@@ -72,6 +72,7 @@ class ImpulseShortStrategy(BaseStrategy):
         self._bar_idx  = 0
         self._in_trade = False
         self._session_active = True
+        self._prev_state_for_timeout = 0
 
     def on_bar(self, bar, ctx) -> None:
         if not self._session_active or self._in_trade:
@@ -318,7 +319,7 @@ class ImpulseShortStrategy(BaseStrategy):
             _vwap_fill = vwap_now
             _evwap_pct = (entry_fill - _vwap_fill) / _vwap_fill * 100 if _vwap_fill > 0 else None
 
-            from models import Signal
+            from ..models import Signal
             return Signal(
                 strategy_id  = self.strategy_id,
                 symbol       = self.symbol,

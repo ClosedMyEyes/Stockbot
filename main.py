@@ -27,6 +27,8 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
 
+_position_lock = threading.Lock()
+
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -51,14 +53,17 @@ log = logging.getLogger("orchestrator")
 
 # Reconnect backoff schedule (seconds)
 _BACKOFF = [5, 10, 20, 40, 80, 160, 300]   # then repeats 300s
-_RECONNECT_GIVE_UP = datetime.time(16, 15)   # after this, don't bother
+_RECONNECT_GIVE_UP = datetime.time(15, 35)   # after this, don't bother (15:35 CT = 16:35 ET, ~5 min after IBC closes TWS)
 
 
 class Orchestrator:
 
-    def __init__(self, paper: bool = True):
-        self.paper    = paper
-        self.executor = get_executor(paper)
+    def __init__(self, mode: str = "ibkr"):
+        self.mode  = mode
+        self.paper = (mode == "paper")
+        # IBKRExecution needs the live IB connection, which isn't available until
+        # run() calls feed.connect(). Defer creation there; use paper fallback meanwhile.
+        self.executor = get_executor(mode) if mode != "ibkr" else None
         self.risk     = RiskManager()
         self.ctx_builder = SessionContextBuilder()
         self.state    = StateManager()
@@ -117,6 +122,8 @@ class Orchestrator:
 
         # Last known bar close per symbol — used by EOD safety timer for realistic exit price
         self._last_close: Dict[str, float] = {}
+        # Accumulated intraday volume per symbol — flushed at EOD to feed session total vol
+        self._session_vol: Dict[str, float] = defaultdict(float)
         # Guard against _post_market being called twice (timer + new session)
         self._post_market_done: bool = False
 
@@ -144,8 +151,9 @@ class Orchestrator:
             ctx = self.ctx_builder.get_context(bar.symbol, bar.date)
             self._session_ctxs[bar.symbol] = ctx
 
-        # Track last known close price for every symbol (used by EOD safety timer)
+        # Track last known close price and accumulated volume (used by EOD routines)
         self._last_close[bar.symbol] = bar.close
+        self._session_vol[bar.symbol] += bar.volume
 
         # [R3] Fill verification — check 2 bars after entry
         self._run_fill_verification(bar)
@@ -250,15 +258,13 @@ class Orchestrator:
         For any positions pending verification on this symbol, check if
         2 bars have elapsed. If so, query IBKR for actual shares held.
         """
-        if not self._pending_verify or not self._connected:
+        if self.paper or not self._pending_verify or not self._connected:
             return
 
         bar_now = self._bar_counters.get(bar.symbol, 0)
         to_verify = [
             tid for tid, (_, entry_bar) in list(self._pending_verify.items())
-            if self._positions_meta.get(tid, {}).get("symbol", "") == bar.symbol
-            or self.risk.open_positions.get(tid, None) is not None and
-               getattr(self.risk.open_positions[tid], "symbol", "") == bar.symbol
+            if getattr(self.risk.open_positions.get(tid), "symbol", "") == bar.symbol
         ]
 
         for tid in to_verify:
@@ -276,33 +282,40 @@ class Orchestrator:
             if pos.symbol != bar.symbol:
                 continue
 
-            actual = self._query_actual_shares(pos.symbol, pos.direction)
             del self._pending_verify[tid]
+            # Run the blocking IBKR query in a background thread so the event loop
+            # is never blocked. Capture tid/pos in closure.
+            threading.Thread(
+                target=self._verify_fill_async,
+                args=(tid, pos, expected_shares),
+                daemon=True,
+            ).start()
 
-            if actual is None:
-                log.warning(f"FillVerify {tid}: could not query IBKR shares")
-                continue
+    def _verify_fill_async(self, tid: str, pos: OpenPosition, expected_shares: int):
+        """Background thread: query IBKR for actual fill, adjust or clear."""
+        actual = self._query_actual_shares(pos.symbol, pos.direction)
+        if actual is None:
+            log.warning(f"FillVerify {tid}: could not query IBKR shares")
+            return
 
-            if actual == 0:
-                # Complete miss — no fill
-                log.warning(
-                    f"FillVerify {tid} ({pos.symbol}): COMPLETE MISS — "
-                    f"expected {expected_shares} shares, IBKR shows 0. "
-                    f"Clearing position state."
-                )
-                self._clear_failed_fill(tid, pos)
+        if actual == 0:
+            log.warning(
+                f"FillVerify {tid} ({pos.symbol}): COMPLETE MISS — "
+                f"expected {expected_shares} shares, IBKR shows 0. "
+                f"Clearing position state."
+            )
+            self._clear_failed_fill(tid, pos)
 
-            elif actual < expected_shares * 0.80:
-                # Partial fill — adjust sizing
-                log.warning(
-                    f"FillVerify {tid} ({pos.symbol}): PARTIAL FILL — "
-                    f"expected {expected_shares}, actual {actual}. Adjusting."
-                )
-                pos.shares = actual
-                self.state.on_shares_adjusted(tid, actual)
+        elif actual < expected_shares * 0.80:
+            log.warning(
+                f"FillVerify {tid} ({pos.symbol}): PARTIAL FILL — "
+                f"expected {expected_shares}, actual {actual}. Adjusting."
+            )
+            pos.shares = actual
+            self.state.on_shares_adjusted(tid, actual)
 
-            else:
-                log.info(f"FillVerify {tid} ({pos.symbol}): OK — {actual} shares confirmed")
+        else:
+            log.info(f"FillVerify {tid} ({pos.symbol}): OK — {actual} shares confirmed")
 
     def _query_actual_shares(self, symbol: str, direction: str) -> Optional[int]:
         """Query IBKR for current position size in this symbol."""
@@ -323,8 +336,7 @@ class Orchestrator:
     def _clear_failed_fill(self, trade_id: str, pos: OpenPosition):
         """Remove a position that completely failed to fill."""
         self.risk.open_positions.pop(trade_id, None)
-        self.state._positions.pop(trade_id, None)
-        self.state.save()
+        self.state.on_position_close(trade_id, 0.0, 0.0)  # 0R, $0 — no fill
         self._positions_meta.pop(trade_id, None)
         self._position_entry_bar.pop(trade_id, None)
 
@@ -374,13 +386,19 @@ class Orchestrator:
 
         return None, None
 
-    def _close_position(self, trade_id: str, pos: OpenPosition,
-                        exit_price: float, reason: str, bar: Bar):
-        result_r = self.risk.close_position(trade_id, exit_price, reason)
+    def _do_close(self, trade_id: str, pos: OpenPosition,
+                  exit_price: float, reason: str, exit_time_str: str):
+        """
+        Shared close path — called by both _close_position (has a live bar)
+        and _force_close (EOD timer / no-bar callers).
+        Fires executor.send_exit, writes ll.log_trade, updates state.json.
+        """
+        with _position_lock:
+            result_r = self.risk.close_position(trade_id, exit_price, reason)
         if result_r is None:
             return
 
-        pnl_dollars = result_r * pos.R  # 1R = RISK_PER_TRADE_DOLLARS, so R * R_dollars = pnl
+        pnl_dollars = result_r * pos.R_dollars
 
         for strat in self.strategies.get(pos.symbol, []):
             if strat.strategy_id == pos.strategy_id and strat._in_trade:
@@ -392,7 +410,7 @@ class Orchestrator:
 
         self.executor.send_exit(pos, exit_price, reason)
         ll.log_trade(
-            pos=pos, exit_price=exit_price, exit_time=bar.time,
+            pos=pos, exit_price=exit_price, exit_time=exit_time_str,
             exit_reason=reason, result_r=result_r, bars_to_exit=bars_held,
             meta=self._positions_meta.pop(trade_id, {}),
         )
@@ -407,41 +425,14 @@ class Orchestrator:
         else:
             self._losses += 1
 
+    def _close_position(self, trade_id: str, pos: OpenPosition,
+                        exit_price: float, reason: str, bar: Bar):
+        self._do_close(trade_id, pos, exit_price, reason, exit_time_str=bar.time)
+
     def _force_close(self, trade_id: str, pos: OpenPosition,
                      exit_price: float, reason: str):
-        """
-        Full close path without a Bar object — used by EOD safety timer and
-        any other caller that doesn't have a live bar reference.
-        Fires executor.send_exit, writes ll.log_trade, updates state.json.
-        """
-        result_r = self.risk.close_position(trade_id, exit_price, reason)
-        if result_r is None:
-            return
-
-        pnl_dollars = result_r * pos.R
-
-        for strat in self.strategies.get(pos.symbol, []):
-            if strat.strategy_id == pos.strategy_id and strat._in_trade:
-                strat.on_exit(result_r, reason)
-                break
-
-        bars_held = (self._bar_counters.get(pos.symbol, 0)
-                     - self._position_entry_bar.get(trade_id, 0))
-
-        self.executor.send_exit(pos, exit_price, reason)
-        ll.log_trade(
-            pos=pos, exit_price=exit_price, exit_time="16:00",
-            exit_reason=reason, result_r=result_r, bars_to_exit=bars_held,
-            meta=self._positions_meta.pop(trade_id, {}),
-        )
-        self._position_entry_bar.pop(trade_id, None)
-        self._pending_verify.pop(trade_id, None)
-        self.state.on_position_close(trade_id, result_r, pnl_dollars)
-
-        if result_r > 0:
-            self._wins += 1
-        else:
-            self._losses += 1
+        """No-bar close path — used by EOD safety timer and reconnect recovery."""
+        self._do_close(trade_id, pos, exit_price, reason, exit_time_str="16:00")
 
     # =========================================================================
     # EOD [R5]
@@ -458,6 +449,9 @@ class Orchestrator:
             self._eod_closes += 1
 
         self.ctx_builder.store_session_close(bar.symbol, bar.close)
+        total_vol = self._session_vol.pop(bar.symbol, 0.0)
+        if total_vol > 0:
+            self.ctx_builder.store_session_total_vol(bar.symbol, total_vol)
 
     def _schedule_eod_timer(self, session_date: str):
         """
@@ -503,6 +497,35 @@ class Orchestrator:
         self._eod_timer.daemon = True
         self._eod_timer.start()
         log.info(f"EOD safety timer scheduled for 16:00:30 ({delay:.0f}s from now)")
+
+        # ── Process self-exit timer ───────────────────────────────────────────
+        # Cleanly exits the Python process at PROCESS_EXIT_AT (default 16:45).
+        # By then IBC has already closed TWS (configured at 16:30), all positions
+        # are closed, and daily summary is written. Enables fully unattended operation.
+        try:
+            exit_t = datetime.time.fromisoformat(config.PROCESS_EXIT_AT)
+            exit_target = datetime.datetime.combine(today, exit_t)
+            exit_delay  = (exit_target - now).total_seconds()
+            if exit_delay > 0:
+                def _process_exit():
+                    log.info(
+                        f"PROCESS EXIT TIMER fired at {config.PROCESS_EXIT_AT} — "
+                        f"shutting down cleanly for automated operation."
+                    )
+                    self._shutting_down = True
+                    if self._session_date and not self._post_market_done:
+                        self._post_market(self._session_date)
+                    if self._feed:
+                        self._feed.stop()
+                    import os as _os
+                    _os._exit(0)   # force-exit the whole process from this thread
+                t_exit = threading.Timer(exit_delay, _process_exit)
+                t_exit.daemon = True
+                t_exit.start()
+                log.info(f"Process exit timer scheduled for {config.PROCESS_EXIT_AT} "
+                         f"({exit_delay:.0f}s from now)")
+        except Exception as e:
+            log.warning(f"Could not schedule process exit timer: {e}")
 
     # =========================================================================
     # STATE TIMEOUT [R6]
@@ -565,6 +588,7 @@ class Orchestrator:
         self._max_sim          = 0
         self._bar_counters     = defaultdict(int)
         self._seen_bars        = set()
+        self._session_vol      = defaultdict(float)
         self._positions_meta.clear()
         self._position_entry_bar.clear()
         self._pending_verify.clear()
@@ -692,10 +716,13 @@ class Orchestrator:
         for sym in self.all_symbols:
             try:
                 bars = feed.request_historical_bars(sym, duration=f"{days} D")
+                _day_vol: Dict[str, float] = defaultdict(float)
                 for bar in bars:
                     self.ctx_builder.on_bar_close(bar)
+                    _day_vol[bar.date] += bar.volume
                     if bar.time == config.EOD_BAR:
                         self.ctx_builder.store_session_close(sym, bar.close)
+                        self.ctx_builder.store_session_total_vol(sym, _day_vol[bar.date])
                 log.info(f"Warm-up done: {sym} ({len(bars)} bars)")
             except Exception as e:
                 log.error(f"Warm-up failed for {sym}: {e}")
@@ -727,6 +754,10 @@ class Orchestrator:
             f"Startup reconciliation: restored={restored} "
             f"ghost_closed={ghosts} orphans={orphans}"
         )
+        # Restore per-position meta so exit detection has gap_dir etc.
+        for tid, snap in self.state.saved_positions.items():
+            self._positions_meta[tid] = snap.get("meta", {})
+
         # Restore daily stats from state
         self.risk.restore_session_stats(
             daily_r  = saved.get("daily_r_total", 0.0),
@@ -749,6 +780,9 @@ class Orchestrator:
             return
 
         self._connected = True
+
+        if self.mode == "ibkr":
+            self.executor = get_executor("ibkr", ib=feed._ib)
 
         # [R1] Startup reconciliation before warming up
         today = datetime.date.today().isoformat()
@@ -784,21 +818,28 @@ class Orchestrator:
 
 def main():
     parser = argparse.ArgumentParser(description="Trading Bot Orchestrator")
-    parser.add_argument("--paper", action="store_true", default=True)
-    parser.add_argument("--live",  action="store_false", dest="paper")
+    group = parser.add_mutually_exclusive_group()
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--paper",      action="store_const", const="paper",       dest="mode",
+                       help="Internal simulation — no orders sent")
+    group.add_argument("--ibkr",       action="store_const", const="ibkr",        dest="mode",
+                       help="Direct IBKR order submission via ib_insync placeOrder (default)")
+    group.add_argument("--live",       action="store_const", const="signalstack",  dest="mode",
+                       help="SignalStack webhook (prop firm / live)")
+    parser.set_defaults(mode="ibkr")
     parser.add_argument("--warmup-days", type=int, default=20)
     args = parser.parse_args()
 
-    if not args.paper:
+    if args.mode == "signalstack":
         confirm = input(
-            "⚠️  LIVE MODE — this will fire real orders via SignalStack. "
+            "⚠️  SIGNALSTACK LIVE MODE — this will fire real orders via SignalStack. "
             "Type 'yes' to continue: "
         )
         if confirm.strip().lower() != "yes":
             print("Aborted.")
             return
 
-    orch = Orchestrator(paper=args.paper)
+    orch = Orchestrator(mode=args.mode)
     orch.run(warmup_days=args.warmup_days)
 
 

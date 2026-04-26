@@ -16,8 +16,11 @@ Fields added vs original:
 import datetime
 import logging
 import math
+import zoneinfo
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
+
+_ET = zoneinfo.ZoneInfo("America/New_York")   # all bar times must be in ET to match strategy thresholds
 
 log = logging.getLogger("orchestrator.feed")
 
@@ -257,10 +260,14 @@ class IBKRFeed:
     """
 
     def __init__(self, symbols: List[str]):
-        self.symbols   = symbols
-        self.on_bar    = None   # assigned by Orchestrator before subscribe_bars()
-        self._ib       = IB() if _IB_AVAILABLE else None
-        self._contracts = {}
+        self.symbols      = symbols
+        self.on_bar       = None   # assigned by Orchestrator before subscribe_bars()
+        self.on_disconnect = None  # assigned by Orchestrator after connect()
+        self._ib          = IB() if _IB_AVAILABLE else None
+        self._contracts   = {}
+        self._rt_bar_objects: Dict[str, object] = {}  # sym -> RealTimeBars (unsubscribe)
+        self._ku_bar_objects: Dict[str, object] = {}  # sym -> BarDataList (unsubscribe)
+        self._ku_symbols: set = set()                 # symbols using keepUpToDate
 
     def connect(self, host: str = "127.0.0.1", port: int = 7497,
                 client_id: int = 10) -> bool:
@@ -269,11 +276,22 @@ class IBKRFeed:
             return False
         try:
             self._ib.connect(host, port, clientId=client_id)
+            # Guard against double-registration on reconnect attempts
+            try:
+                self._ib.disconnectedEvent -= self._on_ibkr_disconnect
+            except Exception:
+                pass
+            self._ib.disconnectedEvent += self._on_ibkr_disconnect
             log.info(f"Connected to IBKR {host}:{port} (clientId={client_id})")
             return True
         except Exception as e:
             log.error(f"IBKR connect failed: {e}")
             return False
+
+    def _on_ibkr_disconnect(self):
+        log.warning("ib_insync disconnectedEvent fired")
+        if callable(self.on_disconnect):
+            self.on_disconnect()
 
     def request_historical_bars(self, symbol: str, duration: str = "20 D",
                                 bar_size: str = "1 min") -> List:
@@ -294,16 +312,58 @@ class IBKRFeed:
     def subscribe_bars(self) -> None:
         if not _IB_AVAILABLE or self._ib is None:
             return
-        for sym in self.symbols:
+
+        # Cancel any existing subscriptions before (re)subscribing
+        for bars_obj in self._rt_bar_objects.values():
+            try:
+                self._ib.cancelRealTimeBars(bars_obj)
+            except Exception:
+                pass
+        self._rt_bar_objects.clear()
+
+        for bars_obj in self._ku_bar_objects.values():
+            try:
+                self._ib.cancelHistoricalData(bars_obj)
+            except Exception:
+                pass
+        self._ku_bar_objects.clear()
+        self._ku_symbols.clear()
+
+        sorted_syms = sorted(self.symbols)
+        group_a = sorted_syms[:90]    # reqRealTimeBars (IBKR limit: 100)
+        group_b = sorted_syms[90:]    # reqHistoricalData keepUpToDate (separate limit)
+
+        for sym in group_a:
             contract = self._get_contract(sym)
             bars = self._ib.reqRealTimeBars(
                 contract,
-                barSize=5,        # 5-second bars; aggregated to 1-min in _on_rt_bar
+                barSize=5,
                 whatToShow="TRADES",
                 useRTH=True,
             )
             bars.updateEvent += self._make_rt_handler(sym)
-        log.info(f"Subscribed to real-time bars for {len(self.symbols)} symbols")
+            self._rt_bar_objects[sym] = bars
+
+        for sym in group_b:
+            contract = self._get_contract(sym)
+            bars = self._ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="1 D",
+                barSizeSetting="1 min",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+                keepUpToDate=True,
+            )
+            bars.updateEvent += self._make_ku_handler(sym)
+            self._ku_bar_objects[sym] = bars
+            self._ku_symbols.add(sym)
+
+        log.info(
+            f"Subscribed: {len(group_a)} symbols via reqRealTimeBars, "
+            f"{len(group_b)} via reqHistoricalData(keepUpToDate=True)"
+        )
 
     def start(self) -> None:
         if _IB_AVAILABLE and self._ib:
@@ -325,7 +385,7 @@ class IBKRFeed:
 
     def _adapt_bar(self, b, symbol: str):
         """Convert ib_insync BarData to our Bar model."""
-        from models import Bar
+        from ..models import Bar
         return Bar(
             symbol = symbol,
             date   = str(b.date.date()),
@@ -336,6 +396,20 @@ class IBKRFeed:
             close  = b.close,
             volume = b.volume,
         )
+
+    def _make_ku_handler(self, symbol: str):
+        """Return a handler for keepUpToDate 1-min bars (Group B).
+
+        b.date from formatDate=1 is already in ET — no timezone conversion needed.
+        Initial historical bars arrive with hasNewBar=False; only True signals a
+        newly completed live bar.
+        """
+        def _handler(bars, has_new_bar):
+            if not has_new_bar or self.on_bar is None:
+                return
+            self.on_bar(self._adapt_bar(bars[-1], symbol))
+
+        return _handler
 
     def _make_rt_handler(self, symbol: str):
         """Return a 5-sec-bar aggregator that emits 1-min bars."""
@@ -357,12 +431,16 @@ class IBKRFeed:
         def _emit_minute(rt_bars, minute, sym):
             if self.on_bar is None:
                 return
-            from models import Bar
+            from ..models import Bar
+            # RealTimeBar timestamps are UTC-aware — convert to ET so bar.time
+            # matches the "HH:MM" strings used in strategy thresholds (entry_time_max,
+            # EOD_BAR, RTH_START etc.) which are all expressed in Eastern Time.
+            minute_et = minute.astimezone(_ET)
             bar = Bar(
                 symbol = sym,
-                date   = str(minute.date()),
-                time   = minute.strftime("%H:%M"),
-                open   = rt_bars[0].open,
+                date   = str(minute_et.date()),
+                time   = minute_et.strftime("%H:%M"),
+                open   = rt_bars[0].open_,   # ib_insync uses open_ to avoid shadowing the builtin
                 high   = max(b.high for b in rt_bars),
                 low    = min(b.low  for b in rt_bars),
                 close  = rt_bars[-1].close,

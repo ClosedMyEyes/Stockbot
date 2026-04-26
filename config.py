@@ -32,7 +32,7 @@ MAX_POSITIONS_PER_SYMBOL    = 1       # only one strategy may hold a given symbo
 #   max_dd         : daily drawdown limit for this strategy; hitting it halts
 #                    that strategy for the rest of the session (others keep running)
 STRATEGY_RISK: Dict[str, dict] = {
-    "gf_small_multi": {"risk_per_trade": 125.0, "max_dd":  750.0},
+    "gap_fill_small_multi": {"risk_per_trade": 125.0, "max_dd":  750.0},
     "gap_fill_big":   {"risk_per_trade": 245.0, "max_dd":  1000.0},
     "gap_fill_large": {"risk_per_trade":  48.0, "max_dd":  250.0},
     "impulse_short":  {"risk_per_trade":  42.0, "max_dd":  225.0},
@@ -44,7 +44,7 @@ STRATEGY_RISK: Dict[str, dict] = {
 # When two strategies want the same symbol on the same bar, the one with
 # the lower index wins the slot. Existing open positions are never preempted.
 STRATEGY_PRIORITY: List[str] = [
-    "gf_small_multi",
+    "gap_fill_small_multi",
     "gap_fill_big",
     "gap_fill_large",
     "impulse_short",
@@ -59,6 +59,8 @@ RTH_START = "09:30"
 RTH_END   = "15:59"
 EOD_BAR   = "15:59"
 PREMARKET_ROUTINE_TIME = "09:15"   # when to run ATR/gap pre-calc
+PROCESS_EXIT_AT        = "15:45"   # auto-exit the Python process — uses LOCAL system clock (CT)
+                                   # 15:45 CT = 16:45 ET (IBC closes TWS at 15:30 CT / 16:30 ET)
 
 # =============================================================================
 # SYMBOL UNIVERSES PER STRATEGY
@@ -149,7 +151,7 @@ STRATEGY_UNIVERSES: Dict[str, List[str]] = {
     #   KO and PM (ConsStaples — confirmed dead sector in data).
     "impulse_short": [
         # Financials — best sector, avg_R 0.469
-        "AIG", "AXP", "BAC", "BK", "BLK", "BRK.B", "BX",
+        "AIG", "AXP", "BAC", "BK", "BLK", "BX",  # BRK.B removed: IBKR contract resolution fails (dot in ticker)
         "C", "CB", "CME", "COF",
         "GS", "ICE", "JPM", "MA", "MCO", "MET",
         "PGR", "SCHW", "SPGI", "TRV", "V", "WFC",
@@ -164,7 +166,8 @@ STRATEGY_UNIVERSES: Dict[str, List[str]] = {
         "NKE", "ORLY", "RCL", "SBUX", "TGT", "TJX", "TSLA", "YUM",
 
         # Telecom / Communication Services — avg_R 0.168
-        "ATVI", "CHTR", "CMCSA", "EA", "META", "T", "TMUS", "VZ",
+        # ATVI removed: acquired by Microsoft, delisted Oct 2023 → replaced by TTWO (unverified)
+        "CHTR", "CMCSA", "EA", "META", "T", "TMUS", "TTWO", "VZ",
 
         # Healthcare — avg_R 0.125 (avoid pure biotech: AMGN, GILD excluded)
         "ABBV", "ABT", "BMY", "BSX", "CI", "CVS",
@@ -172,7 +175,8 @@ STRATEGY_UNIVERSES: Dict[str, List[str]] = {
         "SYK", "TMO", "UNH", "ZTS",
 
         # ETF — small sample but 66.7% WR
-        "GLD", "IWM", "PSE", "QQQ", "SPY", "XLF", "XLK",
+        # PSE removed: Invesco liquidated this ETF → replaced by SMH (unverified)
+        "GLD", "IWM", "QQQ", "SMH", "SPY", "XLF", "XLK",
 
         # Tech — lowest avg_R of positive sectors (0.047), selective only
         # High-liquidity names only; INTC, IBM, QCOM, CRM excluded (confirmed losers)
@@ -645,9 +649,9 @@ STRATEGY_PARAMS: Dict[str, dict] = {
         "skip_friday":              False,
         "skip_months":              [],
         "vol_regime_min":           0.5,
-        "vol_regime_max":           99.0,
+        "vol_regime_max":           0,      # 0 = off (matches script default)
         "gap_vol_ratio_min":        1.0,
-        "gap_vol_ratio_max":        3.5,    # cap panic/news gaps; 0 = off
+        "gap_vol_ratio_max":        0,      # 0 = off (matches script default)
         "gap_atr_ratio_min":        0.6,
         "gap_atr_ratio_max":        1.3,    # script default; filters structurally huge gaps
     },

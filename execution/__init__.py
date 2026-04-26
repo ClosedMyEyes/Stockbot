@@ -11,6 +11,8 @@ The orchestrator decides which to use via config.
 import json
 import logging
 import os
+import queue
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -55,6 +57,44 @@ class _RateLimiter:
 _rate_limiter = _RateLimiter(max_calls=2, period=60.0)
 
 
+def _start_webhook_worker(q: queue.Queue) -> threading.Thread:
+    """
+    Background thread that drains the webhook queue with rate limiting.
+    Sleeps happen here — never in the bar callback thread.
+    """
+    def _worker():
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            payload, label = item
+            _rate_limiter.acquire()
+            try:
+                body = json.dumps(payload).encode("utf-8")
+                req  = urllib.request.Request(
+                    config.SIGNALSTACK_WEBHOOK_URL,
+                    data=body,
+                    headers={
+                        "Content-Type":  "application/json",
+                        "Authorization": f"Bearer {os.environ.get('SIGNALSTACK_API_KEY', config.SIGNALSTACK_API_KEY)}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status not in (200, 201, 204):
+                        log.error(f"SignalStack HTTP {resp.status}  [{label}] payload={payload}")
+                    else:
+                        log.info(f"SignalStack → {resp.status}  [{label}]")
+            except Exception as e:
+                log.error(f"SignalStack webhook failed [{label}]: {e}")
+            finally:
+                q.task_done()
+
+    t = threading.Thread(target=_worker, daemon=True, name="signalstack-worker")
+    t.start()
+    return t
+
+
 # =============================================================================
 # PAPER TRADING (SIMULATION)
 # =============================================================================
@@ -88,73 +128,110 @@ class PaperExecution:
 
 
 # =============================================================================
+# IBKR DIRECT EXECUTION
+# =============================================================================
+
+class IBKRExecution:
+    """
+    Submits orders directly to IBKR via ib_insync placeOrder.
+    Works with both paper and live IBKR accounts — the account type is
+    determined by which TWS/Gateway the IB instance is connected to.
+    """
+
+    def __init__(self, ib):
+        self._ib = ib
+        self._trades: Dict[str, object] = {}   # trade_id -> ib Trade
+        self._contracts: Dict[str, object] = {}
+
+    def _get_contract(self, symbol: str):
+        if symbol not in self._contracts:
+            from ib_insync import Stock
+            self._contracts[symbol] = Stock(symbol, "SMART", "USD")
+        return self._contracts[symbol]
+
+    def send_entry(self, pos: OpenPosition) -> bool:
+        from ib_insync import MarketOrder
+        action = "BUY" if pos.direction == "long" else "SELL"
+        try:
+            trade = self._ib.placeOrder(
+                self._get_contract(pos.symbol),
+                MarketOrder(action, pos.shares),
+            )
+            self._trades[pos.trade_id] = trade
+            log.info(
+                f"[IBKR] ENTRY {action} {pos.symbol} {pos.shares}sh @ market  "
+                f"stop={pos.stop:.4f}  tp={pos.tp:.4f}  orderId={trade.order.orderId}"
+            )
+            return True
+        except Exception as e:
+            log.error(f"[IBKR] placeOrder entry failed for {pos.symbol}: {e}")
+            return False
+
+    def send_exit(self, pos: OpenPosition, exit_price: float, reason: str) -> bool:
+        from ib_insync import MarketOrder
+        action = "SELL" if pos.direction == "long" else "BUY"
+        try:
+            self._ib.placeOrder(
+                self._get_contract(pos.symbol),
+                MarketOrder(action, pos.shares),
+            )
+            log.info(f"[IBKR] EXIT {action} {pos.symbol} {pos.shares}sh @ market  ({reason})")
+            return True
+        except Exception as e:
+            log.error(f"[IBKR] placeOrder exit failed for {pos.symbol}: {e}")
+            return False
+
+    def cancel_order(self, pos: OpenPosition) -> bool:
+        trade = self._trades.pop(pos.trade_id, None)
+        if trade is None:
+            log.warning(f"[IBKR] cancel_order: no tracked entry order for {pos.symbol}")
+            return False
+        try:
+            self._ib.cancelOrder(trade.order)
+            log.info(f"[IBKR] CANCEL {pos.symbol}")
+            return True
+        except Exception as e:
+            log.error(f"[IBKR] cancelOrder failed for {pos.symbol}: {e}")
+            return False
+
+
+# =============================================================================
 # SIGNALSTACK WEBHOOK
 # =============================================================================
 
 class SignalStackExecution:
     """
     Fires signals to SignalStack via HTTP POST webhooks.
-    SignalStack then routes to your broker (IBKR paper or live).
+    All HTTP calls happen in a dedicated background thread so the bar callback
+    (ib_insync event loop) never blocks on network I/O or rate-limiter sleeps.
 
-    Webhook format follows the SignalStack spec:
-      POST https://api.signalstack.com/webhook
-      Headers: Content-Type: application/json
-      Body: { "ticker": "AAPL", "action": "buy", "orderType": "market",
-              "contracts": 10 }
-
-    Adjust the payload builder below to match your SignalStack setup.
+    send_entry / send_exit return True immediately after enqueueing — delivery
+    is best-effort async. Failures are logged but do not crash the orchestrator.
     """
 
     def __init__(self):
-        self.webhook_url = config.SIGNALSTACK_WEBHOOK_URL
-        self.api_key     = os.environ.get("SIGNALSTACK_API_KEY",
-                                          config.SIGNALSTACK_API_KEY)
-        if not self.api_key or self.api_key == "YOUR_SIGNALSTACK_API_KEY":
+        api_key = os.environ.get("SIGNALSTACK_API_KEY", config.SIGNALSTACK_API_KEY)
+        if not api_key or api_key == "YOUR_SIGNALSTACK_API_KEY":
             raise RuntimeError(
                 "SignalStack API key not set. "
                 "Export SIGNALSTACK_API_KEY as an environment variable."
             )
-
-    def _post(self, payload: dict) -> bool:
-        body = json.dumps(payload).encode("utf-8")
-        req  = urllib.request.Request(
-            self.webhook_url,
-            data=body,
-            headers={
-                "Content-Type":  "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                status = resp.status
-                if status in (200, 201, 204):
-                    log.info(f"SignalStack → {status}  payload={payload}")
-                    return True
-                else:
-                    log.error(f"SignalStack HTTP {status}  payload={payload}")
-                    return False
-        except Exception as e:
-            log.error(f"SignalStack request failed: {e}  payload={payload}")
-            return False
+        self._q      = queue.Queue()
+        self._worker = _start_webhook_worker(self._q)
 
     def send_entry(self, pos: OpenPosition) -> bool:
-        _rate_limiter.acquire()   # enforce 2-per-minute cap before firing
         action = "buy" if pos.direction == "long" else "sell"
         payload = {
             "ticker":    pos.symbol,
             "action":    action,
             "orderType": "market",
             "contracts": pos.shares,
-            # Custom fields SignalStack passes through to IBKR:
             "comment":   f"{pos.strategy_id}|{pos.trade_id}",
         }
-        return self._post(payload)
+        self._q.put((payload, f"ENTRY {pos.symbol}"))
+        return True
 
     def send_exit(self, pos: OpenPosition, exit_price: float, reason: str) -> bool:
-        _rate_limiter.acquire()   # enforce 2-per-minute cap before firing
-        # Close the position: opposite side
         action = "sell" if pos.direction == "long" else "buy"
         payload = {
             "ticker":    pos.symbol,
@@ -163,13 +240,12 @@ class SignalStackExecution:
             "contracts": pos.shares,
             "comment":   f"EXIT|{pos.trade_id}|{reason}",
         }
-        return self._post(payload)
+        self._q.put((payload, f"EXIT {pos.symbol}"))
+        return True
 
     def cancel_order(self, pos: OpenPosition) -> bool:
-        # SignalStack doesn't have a cancel concept for market orders that already filled.
-        # If needed, send an offsetting market order.
         log.warning(f"[SignalStack] cancel_order called for {pos.symbol} — "
-                    f"no-op (market orders fill immediately in paper mode).")
+                    f"no-op (market orders fill immediately).")
         return True
 
 
@@ -177,10 +253,21 @@ class SignalStackExecution:
 # FACTORY
 # =============================================================================
 
-def get_executor(paper: bool = True):
-    if paper:
-        log.info("Execution mode: PAPER (simulated)")
+def get_executor(mode: str = "paper", ib=None):
+    """
+    mode: "paper"       — internal simulation, no orders sent anywhere
+          "ibkr"        — direct ib_insync placeOrder (requires ib= kwarg)
+          "signalstack" — HTTP webhook to SignalStack
+    """
+    if mode == "paper":
+        log.info("Execution mode: PAPER (simulated, no orders sent)")
         return PaperExecution()
-    else:
+    if mode == "ibkr":
+        if ib is None:
+            raise RuntimeError("IBKRExecution requires an IB instance — pass ib=feed._ib")
+        log.info("Execution mode: IBKR (direct ib_insync placeOrder)")
+        return IBKRExecution(ib)
+    if mode == "signalstack":
         log.info("Execution mode: SIGNALSTACK (live webhook)")
         return SignalStackExecution()
+    raise ValueError(f"Unknown execution mode {mode!r} — choose paper, ibkr, or signalstack")

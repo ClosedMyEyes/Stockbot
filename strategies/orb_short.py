@@ -57,6 +57,7 @@ class OrbShortStrategy(BaseStrategy):
         self._retest_bars      = 0
         self._pending_entry    = None   # set on touch bar; fill next bar open
         self._in_trade         = False
+        self._prev_state_for_timeout = 0
 
         # Resolved on pending fill:
         self._vwap_at_trigger  = None
@@ -143,7 +144,7 @@ class OrbShortStrategy(BaseStrategy):
             self._vwap_at_trigger = pe["vwap_at_trigger"]
             direction = "long" if pe["trigger_dir"] == 1 else "short"
 
-            from models import Signal
+            from ..models import Signal
             return Signal(
                 strategy_id   = self.strategy_id,
                 symbol        = self.symbol,
