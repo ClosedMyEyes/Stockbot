@@ -6,8 +6,11 @@ Signal emitted on WAIT_TRIGGER touch; orchestrator manages exits.
 """
 
 import datetime
+import logging
 import numpy as np
 from .base import BaseStrategy
+
+log = logging.getLogger("strategy.orb_short")
 
 # Internal state constants
 _OBSERVING     = 0
@@ -37,10 +40,13 @@ class OrbShortStrategy(BaseStrategy):
             ratio = ctx.vol_regime_ratio
             if ratio is None or np.isnan(ratio):
                 self._session_active = False
+                log.info(f"[orb_short {self.symbol}] INACTIVE — vol_regime_ratio=None (insufficient history)")
             elif vr_min > 0 and ratio < vr_min:
                 self._session_active = False
+                log.info(f"[orb_short {self.symbol}] INACTIVE — vol_regime_ratio={ratio:.2f} < min {vr_min}")
             elif vr_max > 0 and ratio > vr_max:
                 self._session_active = False
+                log.info(f"[orb_short {self.symbol}] INACTIVE — vol_regime_ratio={ratio:.2f} > max {vr_max}")
 
         # ── State ─────────────────────────────────────────────────────────────
         self._state            = _OBSERVING
@@ -62,6 +68,10 @@ class OrbShortStrategy(BaseStrategy):
         # Resolved on pending fill:
         self._vwap_at_trigger  = None
         self._med_vol          = getattr(ctx, "median_session_vol", None)
+
+    def on_exit(self, result_r: float, reason: str) -> None:
+        self._in_trade       = False
+        self._session_active = False   # one trade per session — matches backtest ONE_TRADE_PER_SESSION=True
 
     def on_bar(self, bar, ctx):
         if not self._session_active or self._in_trade:

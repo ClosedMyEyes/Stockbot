@@ -59,6 +59,9 @@ RTH_START = "09:30"
 RTH_END   = "15:59"
 EOD_BAR   = "15:59"
 PREMARKET_ROUTINE_TIME = "09:15"   # when to run ATR/gap pre-calc
+EOD_SAFETY_AT          = "15:01"   # EOD safety timer — LOCAL system clock (CT)
+                                   # 15:01 CT = 16:01 ET (1 min after market close)
+                                   # MUST fire before PROCESS_EXIT_AT
 PROCESS_EXIT_AT        = "15:45"   # auto-exit the Python process — uses LOCAL system clock (CT)
                                    # 15:45 CT = 16:45 ET (IBC closes TWS at 15:30 CT / 16:30 ET)
 

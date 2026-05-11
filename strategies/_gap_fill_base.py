@@ -7,8 +7,11 @@ Subclasses override _get_effective_stop_type() and on_exit() as needed.
 """
 
 import datetime
+import logging
 import numpy as np
 from .base import BaseStrategy
+
+log = logging.getLogger("strategy.gap_fill")
 
 _WAIT_ENTRY = 0
 _IN_TRADE   = 1
@@ -172,9 +175,17 @@ class GapFillBaseStrategy(BaseStrategy):
             gap_atr_r = round(gap_size / daily_atr, 4) if (daily_atr and daily_atr > 0) else None
             if GAP_ATR_MIN > 0:
                 if gap_atr_r is None or gap_atr_r < GAP_ATR_MIN:
+                    log.info(
+                        f"[{self.strategy_id} {self.symbol}] gap {abs_gap_pct*100:.2f}% "
+                        f"FILTERED gap_atr_ratio={gap_atr_r} < min {GAP_ATR_MIN}"
+                    )
                     self._session_active = False; return None
             if GAP_ATR_MAX > 0:
                 if gap_atr_r is None or gap_atr_r > GAP_ATR_MAX:
+                    log.info(
+                        f"[{self.strategy_id} {self.symbol}] gap {abs_gap_pct*100:.2f}% "
+                        f"FILTERED gap_atr_ratio={gap_atr_r} > max {GAP_ATR_MAX}"
+                    )
                     self._session_active = False; return None
 
             self._gap_dir       = gap_dir
@@ -186,6 +197,11 @@ class GapFillBaseStrategy(BaseStrategy):
             fill_target_pct     = p.get("gap_fill_target_pct", 3.0)
             self._tp_raw        = bar_open + gap_dir * fill_target_pct * gap_size
             self._gap_qualified = True
+            log.info(
+                f"[{self.strategy_id} {self.symbol}] gap {abs_gap_pct*100:.2f}% "
+                f"QUALIFIED  gap_atr_ratio={gap_atr_r}  "
+                f"dir={'↓long' if gap_dir == 1 else '↑short'}"
+            )
 
         if not self._gap_qualified:
             return None

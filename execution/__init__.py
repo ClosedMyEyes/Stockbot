@@ -168,18 +168,30 @@ class IBKRExecution:
             return False
 
     def send_exit(self, pos: OpenPosition, exit_price: float, reason: str) -> bool:
+        import asyncio
         from ib_insync import MarketOrder
-        action = "SELL" if pos.direction == "long" else "BUY"
+        action   = "SELL" if pos.direction == "long" else "BUY"
+        contract = self._get_contract(pos.symbol)
+        order    = MarketOrder(action, pos.shares)
+        label    = f"[IBKR] EXIT {action} {pos.symbol} {pos.shares}sh @ market  ({reason})"
+
+        def _place():
+            try:
+                self._ib.placeOrder(contract, order)
+                log.info(label)
+            except Exception as e:
+                log.error(f"[IBKR] placeOrder exit failed for {pos.symbol}: {e}")
+
         try:
-            self._ib.placeOrder(
-                self._get_contract(pos.symbol),
-                MarketOrder(action, pos.shares),
-            )
-            log.info(f"[IBKR] EXIT {action} {pos.symbol} {pos.shares}sh @ market  ({reason})")
-            return True
-        except Exception as e:
-            log.error(f"[IBKR] placeOrder exit failed for {pos.symbol}: {e}")
-            return False
+            asyncio.get_running_loop()
+            # On the ib event-loop thread — call directly.
+            _place()
+        except RuntimeError:
+            # Called from a non-event-loop thread (e.g. EOD safety timer).
+            # Schedule onto ib's event loop so placeOrder has its event loop context.
+            self._ib.loop.call_soon_threadsafe(_place)
+            log.info(f"[IBKR] EXIT queued on event loop: {action} {pos.symbol} {pos.shares}sh  ({reason})")
+        return True
 
     def cancel_order(self, pos: OpenPosition) -> bool:
         trade = self._trades.pop(pos.trade_id, None)

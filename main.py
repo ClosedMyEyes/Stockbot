@@ -40,6 +40,10 @@ logging.basicConfig(
     ],
 )
 
+# ib_insync logs every portfolio update, order status tick, and wrapper event
+# at INFO level — extremely noisy when positions are open. Keep WARNING+ only.
+logging.getLogger("ib_insync").setLevel(logging.WARNING)
+
 from . import config
 from .models import Bar, OpenPosition, Signal
 from .strategies import build_strategy, BaseStrategy
@@ -318,17 +322,30 @@ class Orchestrator:
             log.info(f"FillVerify {tid} ({pos.symbol}): OK — {actual} shares confirmed")
 
     def _query_actual_shares(self, symbol: str, direction: str) -> Optional[int]:
-        """Query IBKR for current position size in this symbol."""
+        """Query IBKR for current position size in this symbol.
+
+        ib.positions() returns the cached portfolio snapshot that ib_insync
+        maintains from TWS updatePortfolio events — it does NOT make a blocking
+        network call, so it is safe to call from a background thread while the
+        event loop is running.  reqPositions() (the blocking variant) would
+        deadlock when called off the event-loop thread.
+        """
         try:
             ib = self._feed._ib if self._feed else None
             if ib is None:
                 return None
-            positions = ib.positions()
-            for p in positions:
-                if p.contract.symbol == symbol:
-                    qty = int(abs(p.position))
-                    return qty
-            return 0  # no position found = complete miss
+            # ib.positions() reads from the in-memory portfolio cache; no
+            # round-trip to TWS required.  Give the cache a moment to populate
+            # on the first call after a fresh connection.
+            import time as _time
+            for attempt in range(3):
+                positions = ib.positions()
+                for p in positions:
+                    if p.contract.symbol == symbol and p.contract.secType == "STK":
+                        return int(abs(p.position))
+                if attempt < 2:
+                    _time.sleep(1)   # cache may not have arrived yet — retry
+            return 0  # no position found after retries = complete miss
         except Exception as e:
             log.warning(f"_query_actual_shares({symbol}): {e}")
             return None
@@ -345,7 +362,13 @@ class Orchestrator:
                 strat._in_trade = False
                 break
 
-        log.info(f"Cleared failed fill for {pos.strategy_id}({pos.symbol}) trade_id={trade_id}")
+        log.warning(
+            f"FAILED FILL CLEARED — if you see this position on your broker, "
+            f"close it manually and investigate.\n"
+            f"  trade_id={trade_id}  strategy={pos.strategy_id}  symbol={pos.symbol}\n"
+            f"  direction={pos.direction}  shares={pos.shares}\n"
+            f"  entry={pos.entry_price:.4f}  stop={pos.stop:.4f}  tp={pos.tp:.4f}"
+        )
 
     # =========================================================================
     # EXIT DETECTION
@@ -466,9 +489,8 @@ class Orchestrator:
         except ValueError:
             return
 
-        target = datetime.datetime.combine(
-            today, datetime.time(16, 0, 30)
-        )
+        eod_safety_t = datetime.time.fromisoformat(config.EOD_SAFETY_AT)
+        target = datetime.datetime.combine(today, eod_safety_t)
         now    = datetime.datetime.now()
         delay  = (target - now).total_seconds()
 
@@ -496,7 +518,7 @@ class Orchestrator:
         self._eod_timer = threading.Timer(delay, _eod_safety)
         self._eod_timer.daemon = True
         self._eod_timer.start()
-        log.info(f"EOD safety timer scheduled for 16:00:30 ({delay:.0f}s from now)")
+        log.info(f"EOD safety timer scheduled for {config.EOD_SAFETY_AT} CT ({delay:.0f}s from now)")
 
         # ── Process self-exit timer ───────────────────────────────────────────
         # Cleanly exits the Python process at PROCESS_EXIT_AT (default 16:45).

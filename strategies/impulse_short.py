@@ -74,6 +74,10 @@ class ImpulseShortStrategy(BaseStrategy):
         self._session_active = True
         self._prev_state_for_timeout = 0
 
+    def on_exit(self, result_r: float, reason: str) -> None:
+        self._in_trade       = False
+        self._session_active = False   # one trade per session — go dormant after any exit
+
     def on_bar(self, bar, ctx) -> None:
         if not self._session_active or self._in_trade:
             return None
