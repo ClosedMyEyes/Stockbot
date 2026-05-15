@@ -24,7 +24,8 @@ SIGNALSTACK_API_KEY     = "YOUR_SIGNALSTACK_API_KEY"   # set via env var in prod
 # RISK PARAMETERS
 # =============================================================================
 MAX_SIMULTANEOUS_POSITIONS  = 6       # max open trades across all strategies at once
-DAILY_LOSS_LIMIT_DOLLARS    = 1000.0  # portfolio-level hard stop (sum of all per-strategy DDs)
+DAILY_LOSS_LIMIT_DOLLARS    = 1500.0  # portfolio-level hard stop — raised from $1000 to maintain
+                                      # same R-count protection at 1.5x regime boost sizing
 MAX_POSITIONS_PER_SYMBOL    = 1       # only one strategy may hold a given symbol at a time
 
 # Per-strategy risk settings.

@@ -32,6 +32,10 @@ class RiskManager:
         self._strategy_pnl:     Dict[str, float] = defaultdict(float)
         self._halted_strategies: Set[str]        = set()
 
+        # Regime scale factors set each session — scale both risk_per_trade
+        # and max_dd so the circuit breaker still fires after the same R count.
+        self._regime_scales: Dict[str, float] = {}
+
     # ── Session management ────────────────────────────────────────────────────
 
     def reset_day(self, session_date: str):
@@ -41,8 +45,18 @@ class RiskManager:
         self._session_date      = session_date
         self._strategy_pnl      = defaultdict(float)
         self._halted_strategies = set()
+        self._regime_scales     = {}   # cleared until load_for_session() sets them
         # Note: open_positions are NOT cleared here — EOD close handles that.
         log.info(f"[{session_date}] Risk manager reset. All halts cleared.")
+
+    def apply_regime_scales(self, scales: Dict[str, float]) -> None:
+        """
+        Set per-strategy scale factors for this session (from regime.py).
+        Scales both risk_per_trade and max_dd so the circuit breaker
+        still trips after the same number of losing R's at any size.
+        """
+        self._regime_scales = dict(scales)
+        log.info(f"Regime scales applied: {self._regime_scales}")
 
     # ── Main gate ─────────────────────────────────────────────────────────────
 
@@ -80,9 +94,11 @@ class RiskManager:
             )
             return None
 
-        # Per-strategy risk sizing
-        strat_risk = config.STRATEGY_RISK.get(strat_id, {})
-        risk_per_trade = strat_risk.get("risk_per_trade", 100.0)
+        # Per-strategy risk sizing (scaled by today's regime factor)
+        strat_risk     = config.STRATEGY_RISK.get(strat_id, {})
+        base_risk      = strat_risk.get("risk_per_trade", 100.0)
+        regime_scale   = self._regime_scales.get(strat_id, 1.0)
+        risk_per_trade = base_risk * regime_scale
 
         risk_per_share = abs(signal.entry_price - signal.stop)
         if risk_per_share <= 0:
@@ -106,8 +122,9 @@ class RiskManager:
             entry_time   = signal.bar_time,
             session_date = signal.session_date,
         )
+        scale_tag = f" [regime {regime_scale:.2f}x]" if regime_scale != 1.0 else ""
         log.info(
-            f"APPROVED [{strat_id} {signal.symbol}] "
+            f"APPROVED [{strat_id} {signal.symbol}]{scale_tag} "
             f"{signal.direction.upper()} {shares}sh @ {signal.entry_price:.2f} "
             f"stop={signal.stop:.2f}  tp={signal.tp:.2f}  "
             f"R=${R_dollars:.2f} (target ${risk_per_trade:.0f})"
@@ -167,8 +184,11 @@ class RiskManager:
             f"daily_P&L=${self.daily_pnl_dollars:+.2f}"
         )
 
-        # Per-strategy DD halt
-        strat_max_dd = config.STRATEGY_RISK.get(pos.strategy_id, {}).get("max_dd", None)
+        # Per-strategy DD halt (max_dd scales with regime so circuit breaker
+        # still fires after the same number of losing R's at any position size)
+        base_max_dd  = config.STRATEGY_RISK.get(pos.strategy_id, {}).get("max_dd", None)
+        regime_scale = self._regime_scales.get(pos.strategy_id, 1.0)
+        strat_max_dd = base_max_dd * regime_scale if base_max_dd else None
         if strat_max_dd and self._strategy_pnl[pos.strategy_id] <= -abs(strat_max_dd):
             self._halted_strategies.add(pos.strategy_id)
             log.warning(

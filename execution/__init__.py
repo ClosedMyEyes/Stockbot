@@ -155,7 +155,7 @@ class IBKRExecution:
         try:
             trade = self._ib.placeOrder(
                 self._get_contract(pos.symbol),
-                MarketOrder(action, pos.shares),
+                MarketOrder(action, pos.shares, tif='DAY'),
             )
             self._trades[pos.trade_id] = trade
             log.info(
@@ -172,7 +172,7 @@ class IBKRExecution:
         from ib_insync import MarketOrder
         action   = "SELL" if pos.direction == "long" else "BUY"
         contract = self._get_contract(pos.symbol)
-        order    = MarketOrder(action, pos.shares)
+        order    = MarketOrder(action, pos.shares, tif='DAY')
         label    = f"[IBKR] EXIT {action} {pos.symbol} {pos.shares}sh @ market  ({reason})"
 
         def _place():

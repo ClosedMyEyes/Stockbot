@@ -52,6 +52,7 @@ from .execution import get_executor
 from .data.feed import IBKRFeed, SessionContextBuilder, SessionContext
 from . import logging_layer as ll
 from .state_manager import StateManager
+from .regime import load_for_session
 
 log = logging.getLogger("orchestrator")
 
@@ -619,6 +620,10 @@ class Orchestrator:
         self.risk.reset_day(session_date)
         self.state.clear_session()
         self._post_market_done = False  # reset guard for new session
+
+        # Load today's regime and apply scale factors to risk sizing + max_dd
+        regime_payload = load_for_session()
+        self.risk.apply_regime_scales(regime_payload["scales"])
 
         # [R5] Schedule EOD safety timer
         self._schedule_eod_timer(session_date)
