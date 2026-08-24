@@ -39,7 +39,7 @@ For each position in state.json:
 
 For each IBKR position NOT in state.json:
   C. Orphan — not ours or pre-existing manual trade.
-       Log WARN. Offer to close via emergency_close_orphan().
+       Log WARN. Never touched automatically — review manually.
 """
 
 import json
@@ -333,12 +333,15 @@ class StateManager:
         Falls back to entry_price (0R) if nothing found.
         """
         try:
-            execs = ib.executions()
+            # ib.fills() returns Fill objects carrying .contract and .execution.
+            # (ib.executions() returns bare Execution objects with no contract —
+            # using it here raised AttributeError and always fell back to 0R.)
+            fills = ib.fills()
             # Filter by symbol, opposite action (our exit would be buy-to-cover or sell)
             exit_action = "BOT" if direction == "short" else "SLD"
             candidates  = [
-                e for e in execs
-                if e.contract.symbol == symbol and e.execution.side == exit_action
+                f for f in fills
+                if f.contract.symbol == symbol and f.execution.side == exit_action
             ]
             if candidates:
                 # Most recent execution
@@ -351,9 +354,12 @@ class StateManager:
     @staticmethod
     def _estimate_result_r(snap: dict, exit_price: float) -> float:
         try:
-            ep  = snap["entry_price"]
-            R   = snap["R_dollars"]
-            d   = 1 if snap["direction"] == "long" else -1
-            return round((exit_price - ep) * d / R, 4) if R > 0 else 0.0
+            ep      = snap["entry_price"]
+            # R is per-share risk (entry-to-stop distance), NOT R_dollars —
+            # (exit - entry) is per-share P&L, so dividing by the whole-trade
+            # dollar risk understated R by roughly the share count.
+            risk_ps = abs(ep - snap["stop"])
+            d       = 1 if snap["direction"] == "long" else -1
+            return round((exit_price - ep) * d / risk_ps, 4) if risk_ps > 0 else 0.0
         except Exception:
             return 0.0
