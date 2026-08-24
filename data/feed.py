@@ -401,13 +401,24 @@ class IBKRFeed:
         """Return a handler for keepUpToDate 1-min bars (Group B).
 
         b.date from formatDate=1 is already in ET — no timezone conversion needed.
-        Initial historical bars arrive with hasNewBar=False; only True signals a
-        newly completed live bar.
+
+        hasNewBar=True means ib_insync just APPENDED the newly started bar, so
+        bars[-1] is a partial bar (only the first seconds of the new minute).
+        The bar that just COMPLETED — with its final OHLCV — is bars[-2]; that
+        is the one we emit. The same-date guard skips the first append after
+        the initial snapshot when the snapshot ends on a previous session
+        (pre-market start: bars[-2] would be yesterday's last bar, which must
+        not be re-fed as a live bar).
         """
         def _handler(bars, has_new_bar):
             if not has_new_bar or self.on_bar is None:
                 return
-            self.on_bar(self._adapt_bar(bars[-1], symbol))
+            if len(bars) < 2:
+                return
+            completed, started = bars[-2], bars[-1]
+            if completed.date.date() != started.date.date():
+                return
+            self.on_bar(self._adapt_bar(completed, symbol))
 
         return _handler
 

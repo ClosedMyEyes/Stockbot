@@ -5,14 +5,16 @@ Robustness additions vs v3:
   [R1] State persistence  — state.json written atomically on every position
        change. Survives crash, kill -9, TWS restart, network blip.
   [R2] Reconnect loop     — exponential backoff (5s→10s→20s→...→5min) in a
-       daemon thread. Gives up after 16:15 (market closed). On reconnect,
-       reconciles state.json against actual IBKR positions.
+       daemon thread. Gives up at _RECONNECT_GIVE_UP (15:35 local/CT = 16:35 ET,
+       market closed). On reconnect, reconciles state.json against actual
+       IBKR positions.
   [R3] Fill verification  — 2 bars after entry, reqPositions() confirms actual
        shares. Adjusts sizing on partial fill; clears state on complete miss.
   [R4] Bar dedup          — (symbol, date, time) set drops duplicate bars that
        ib_insync occasionally re-emits.
-  [R5] EOD safety timer   — threading.Timer fires at 16:00:30 regardless of
-       whether the 15:59 bar arrived. Guarantees all positions are closed.
+  [R5] EOD safety timer   — threading.Timer fires at config.EOD_SAFETY_AT
+       (15:01 local/CT = 16:01 ET) regardless of whether the 15:59 bar
+       arrived. Guarantees all positions are closed.
   [R6] State timeouts     — strategies stuck in a non-idle state for >90 bars
        since last transition are auto-reset (orphaned pending_entry etc.).
 """
@@ -94,6 +96,13 @@ class Orchestrator:
         self._session_date: str  = ""
         self._session_ctxs: Dict[str, SessionContext] = {}
         self._session_open: bool = False
+        # Per-symbol strategy reset tracking: symbol → session date it was
+        # last reset for. Strategies are reset lazily on their own symbol's
+        # first bar of the session, AFTER SessionContextBuilder has built that
+        # symbol's fresh context — resetting all symbols at once on the global
+        # rollover bar hands every other symbol its previous session's context
+        # (stale prior_close, weekday filters evaluated on yesterday's date).
+        self._strat_session: Dict[str, str] = {}
 
         # Daily stats
         self._signal_count     = 0
@@ -155,6 +164,16 @@ class Orchestrator:
         if ctx is None:
             ctx = self.ctx_builder.get_context(bar.symbol, bar.date)
             self._session_ctxs[bar.symbol] = ctx
+
+        # Lazy per-symbol session reset — this symbol's first bar of the day,
+        # with its own fresh context (see _strat_session comment in __init__)
+        if self._strat_session.get(bar.symbol) != bar.date:
+            self._strat_session[bar.symbol] = bar.date
+            for strat in self.strategies.get(bar.symbol, []):
+                try:
+                    strat.reset_session(ctx)
+                except Exception as e:
+                    log.error(f"reset_session error [{strat}]: {e}", exc_info=True)
 
         # Track last known close price and accumulated volume (used by EOD routines)
         self._last_close[bar.symbol] = bar.close
@@ -424,15 +443,22 @@ class Orchestrator:
 
         pnl_dollars = result_r * pos.R_dollars
 
+        # Send the closing order FIRST — nothing that can raise (strategy
+        # callbacks, CSV writes) may stand between exit detection and the
+        # order reaching the broker.
+        self.executor.send_exit(pos, exit_price, reason)
+
         for strat in self.strategies.get(pos.symbol, []):
             if strat.strategy_id == pos.strategy_id and strat._in_trade:
-                strat.on_exit(result_r, reason)
+                try:
+                    strat.on_exit(result_r, reason)
+                except Exception as e:
+                    log.error(f"on_exit error [{strat}]: {e}", exc_info=True)
                 break
 
         bars_held = (self._bar_counters.get(pos.symbol, 0)
                      - self._position_entry_bar.get(trade_id, 0))
 
-        self.executor.send_exit(pos, exit_price, reason)
         ll.log_trade(
             pos=pos, exit_price=exit_price, exit_time=exit_time_str,
             exit_reason=reason, result_r=result_r, bars_to_exit=bars_held,
@@ -479,8 +505,9 @@ class Orchestrator:
 
     def _schedule_eod_timer(self, session_date: str):
         """
-        [R5] Schedule a safety timer for 16:00:30 that closes any positions
-        still open even if the 15:59 bar never arrives for some symbols.
+        [R5] Schedule a safety timer for config.EOD_SAFETY_AT (local clock)
+        that closes any positions still open even if the 15:59 bar never
+        arrives for some symbols.
         """
         if self._eod_timer is not None:
             self._eod_timer.cancel()
@@ -628,13 +655,11 @@ class Orchestrator:
         # [R5] Schedule EOD safety timer
         self._schedule_eod_timer(session_date)
 
-        for sym, strats in self.strategies.items():
-            ctx = self.ctx_builder.get_context(sym, session_date)
-            for strat in strats:
-                try:
-                    strat.reset_session(ctx)
-                except Exception as e:
-                    log.error(f"reset_session error [{strat}]: {e}", exc_info=True)
+        # NOTE: strategies are NOT reset here. At this point only the symbol
+        # whose bar triggered the rollover has a fresh SessionContext — every
+        # other symbol's cached context is still yesterday's. Each symbol's
+        # strategies are reset lazily in on_bar when that symbol's first bar
+        # of the new session arrives (see _strat_session).
 
     def _post_market(self, session_date: str):
         if self._post_market_done:
@@ -669,7 +694,8 @@ class Orchestrator:
     def _reconnect_loop(self, feed: IBKRFeed):
         """
         Daemon thread. On disconnect, attempts reconnect with exponential
-        backoff. Gives up at 16:15 (market is closed, nothing to protect).
+        backoff. Gives up at _RECONNECT_GIVE_UP (15:35 local/CT = 16:35 ET —
+        market is closed, nothing to protect).
         On successful reconnect, reconciles state and resubscribes bars.
         """
         backoff_idx = 0
@@ -680,7 +706,7 @@ class Orchestrator:
 
             now = datetime.datetime.now().time()
             if now >= _RECONNECT_GIVE_UP:
-                log.warning("Reconnect loop: past 16:15 — giving up for today")
+                log.warning(f"Reconnect loop: past {_RECONNECT_GIVE_UP} local — giving up for today")
                 return
 
             log.info(f"Reconnect attempt {backoff_idx}...")
@@ -845,7 +871,6 @@ class Orchestrator:
 
 def main():
     parser = argparse.ArgumentParser(description="Trading Bot Orchestrator")
-    group = parser.add_mutually_exclusive_group()
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--paper",      action="store_const", const="paper",       dest="mode",
                        help="Internal simulation — no orders sent")
