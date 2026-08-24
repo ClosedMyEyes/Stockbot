@@ -137,10 +137,11 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
 Bar times are **Eastern Time** — `data/feed.py` converts IBKR's UTC-aware
 RealTimeBar timestamps to `America/New_York` via `zoneinfo`, so all strategy
 time thresholds (e.g. `RTH_START = "09:30"`, `EOD_BAR = "15:59"`) are ET.
-The EOD safety timer, reconnect give-up, and process-exit timer run on the
-**local system clock**, which is assumed to be **Central Time** (see comments
-in `config.py`). If you deploy on a machine in a different timezone, adjust
-`EOD_SAFETY_AT`, `PROCESS_EXIT_AT`, and `_RECONNECT_GIVE_UP` accordingly.
+The EOD safety timer, reconnect give-up, and process-exit timer values
+(`EOD_SAFETY_AT`, `PROCESS_EXIT_AT`, `_RECONNECT_GIVE_UP`) are defined in
+**Central Time** and evaluated against `America/Chicago` explicitly (not the
+naive local clock), so they fire at the right wall-clock moment even if the
+machine is deployed in a different timezone.
 
 ---
 
@@ -327,7 +328,7 @@ print(live_gfl["result_R"].describe())
 | ~~Restart wipes restored session state~~ | **Fixed 2026-08-23.** `_on_new_session()` is restart-aware: same-session restarts keep restored daily P&L/halts/positions/meta, and restored positions' strategies are re-marked in-trade on their symbol's first bar. Covered by `tests/test_restart_session.py`. |
 | ~~Exit fill prices in logs~~ | **Fixed 2026-08-23.** Broker fills now recorded: `entry_fill_price` / `exit_fill_price` / `slippage_r` columns appended to trade_log.csv plus a full `fill_log.csv`; `result_R` intentionally stays trigger-based for backtest comparability (see "Comparing live vs backtest"). |
 | ~~Disconnected-exit fill lookup broken~~ | **Fixed 2026-08-23.** `_query_exit_fill` now uses `ib.fills()` (Fill objects carry `.contract`), and `_estimate_result_r` divides by per-share risk instead of `R_dollars`. Covered by `tests/test_state_ghost.py`. |
-| Position meta not persisted | `state_manager.on_position_open` reads `getattr(pos, "meta", {})` but `OpenPosition` has no such attribute — always `{}`. Pass `signal.meta` through instead. |
+| ~~Position meta not persisted~~ | **Fixed 2026-08-23.** `signal.meta` is passed into `on_position_open` — state.json now carries `gap_dir` etc. and restarts restore it. |
 | ~~Hold-cap `hold_cap_exit_r` semantics~~ | **Resolved 2026-08-23** — owner confirmed: at the cap, cut the trade only if unrealized R ≤ `hold_cap_exit_r`; winners keep running. Wired into `_detect_exit()` (absent threshold = unconditional cap). All caps remain 0 = disabled. |
 | ~~Dashboard~~               | **Fixed 2026-08-23.** Renamed to `dashboard/__init__.py`, started by `run()` behind `config.DASHBOARD_ENABLE` on a daemon thread (crash-isolated from trading), binds `127.0.0.1` only, and takes the position lock around `risk.summary()`. Covered by `tests/test_dashboard.py`. |
 | IBKR subscription limits    | 164 unique symbols: 90 via `reqRealTimeBars` + 74 via `keepUpToDate` historical. Default live market-data entitlement is 100 concurrent lines — verify your account's line count or expect "max tickers reached" errors on part of the universe. |

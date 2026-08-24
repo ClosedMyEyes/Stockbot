@@ -341,10 +341,28 @@ DONE (in working tree, not yet committed):
       only if unrealized R <= threshold; winners keep running; absent
       threshold = unconditional. All caps still 0 = disabled.
 
-STILL OPEN: P2-3 (encapsulation), P2-4 (timezone robustness), P2-5 (meta
-persistence), P2-6 remainder (market-data lines entitlement check, warm-up/
-live dedup overlap — both operational/minor). Plus: live paper-TWS
-verification of the bracket flow once TWS is installed.
+  - 2026-08-23 (final batch — the whole written list is now done):
+    * P2-3 encapsulation: BaseStrategy grew a public surface (in_trade
+      property, clear_in_trade(), state_key, force_reset(ctx)); orchestrator
+      and reconciliation no longer touch strategy underscores; the
+      _prev_state_for_timeout attribute stuffing moved into an
+      orchestrator-side dict. Zero behavior change (suite green).
+    * P2-4 timezone: timers ( EOD safety, process exit, reconnect give-up)
+      now compute "now" explicitly in America/Chicago instead of the naive
+      local clock — identical on the current CT box, correct anywhere.
+    * P2-5 meta persistence: _handle_signal passes signal.meta into
+      on_position_open — state.json now really carries gap_dir etc.
+    * warm-up/live dedup overlap: warm_up seeds today's bars into the dedup
+      set; _on_new_session retains same-session keys, so an intraday start
+      can't double-count VWAP/volume from a re-emitted bar.
+    * subscribe_bars logs a WARNING when >100 streaming subscriptions are
+      requested (default IBKR market-data entitlement).
+
+STILL OPEN (operational only, needs the user/TWS):
+  - live paper-TWS verification of the bracket flow (enter → kill bot →
+    stop+TP resting → restart → children re-associated)
+  - confirm the IBKR account's market-data line entitlement covers 164
+    symbols (or trim universes)
 
 NOTE: this repo copy of HANDOFF.md is now the living document; the copy in
 C:\Users\mark\Downloads is stale and can be deleted.

@@ -25,9 +25,34 @@ class BaseStrategy(ABC):
         Must NOT be called while _in_trade=True (orchestrator gates this).
         """
 
+    # ── Public surface for the orchestrator / reconciliation ────────────────
+    # (so callers never have to reach into _underscore internals)
+
+    @property
+    def in_trade(self) -> bool:
+        return self._in_trade
+
     def mark_in_trade(self) -> None:
         """Called by orchestrator after a signal is accepted and executed."""
         self._in_trade = True
+
+    def clear_in_trade(self) -> None:
+        """Called by orchestrator/reconciliation when the position is gone."""
+        self._in_trade = False
+
+    @property
+    def state_key(self):
+        """Opaque state-machine key for stuck-state detection.
+        None or 0 means idle (WAIT_BREAK / WAIT_ENTRY / OBSERVING)."""
+        return getattr(self, "_state", None)
+
+    def force_reset(self, ctx) -> None:
+        """Reset a stuck strategy to idle. With a context, do a full session
+        reset; without one, just zero the state machine."""
+        if ctx is not None:
+            self.reset_session(ctx)
+        else:
+            self._state = 0
 
     def on_exit(self, result_r: float, reason: str) -> None:
         """

@@ -364,6 +364,14 @@ class IBKRFeed:
             f"Subscribed: {len(group_a)} symbols via reqRealTimeBars, "
             f"{len(group_b)} via reqHistoricalData(keepUpToDate=True)"
         )
+        total = len(sorted_syms)
+        if total > 100:
+            log.warning(
+                f"{total} streaming subscriptions requested — IBKR's default "
+                f"market-data entitlement is 100 concurrent lines. If your "
+                f"account has no line boosters, part of the universe will "
+                f"fail with 'max tickers reached' — watch for error 101."
+            )
 
     def start(self) -> None:
         if _IB_AVAILABLE and self._ib:

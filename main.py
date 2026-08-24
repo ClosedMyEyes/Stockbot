@@ -62,6 +62,18 @@ log = logging.getLogger("orchestrator")
 _BACKOFF = [5, 10, 20, 40, 80, 160, 300]   # then repeats 300s
 _RECONNECT_GIVE_UP = datetime.time(15, 35)   # after this, don't bother (15:35 CT = 16:35 ET, ~5 min after IBC closes TWS)
 
+# Timer times in config (EOD_SAFETY_AT, PROCESS_EXIT_AT, _RECONNECT_GIVE_UP)
+# are defined in Central Time. Computing "now" explicitly in America/Chicago
+# (instead of the naive local clock) keeps them correct even if the box is
+# ever deployed in a different timezone. Values are unchanged on a CT box.
+import zoneinfo
+_CENTRAL = zoneinfo.ZoneInfo("America/Chicago")
+
+
+def _now_central() -> datetime.datetime:
+    """Naive datetime representing 'now' on the Central Time wall clock."""
+    return datetime.datetime.now(_CENTRAL).replace(tzinfo=None)
+
 
 class Orchestrator:
 
@@ -139,6 +151,7 @@ class Orchestrator:
 
         # [R6] Strategy state-transition bar tracking: (sym, strategy_id) → bar_count at last transition
         self._strat_transition_bar: Dict[tuple, int] = {}
+        self._strat_prev_state:     Dict[tuple, object] = {}
         self._STATE_TIMEOUT_BARS = 90
 
         # Last known bar close per symbol — used by EOD safety timer for realistic exit price
@@ -188,7 +201,7 @@ class Orchestrator:
                     # Position restored after a mid-session restart —
                     # reset_session cleared the flag; re-mark it so the
                     # strategy can't signal a duplicate entry.
-                    strat._in_trade = True
+                    strat.mark_in_trade()
 
         # Track last known close price and accumulated volume (used by EOD routines)
         self._last_close[bar.symbol] = bar.close
@@ -216,7 +229,7 @@ class Orchestrator:
             key=lambda s: self._priority.get(s.strategy_id, 999),
         )
         for strat in strats_for_symbol:
-            if strat._in_trade:
+            if strat.in_trade:
                 continue
 
             # [R6] State timeout — reset strategies stuck mid-flow
@@ -282,8 +295,9 @@ class Orchestrator:
             )
         self._signals_accepted += 1
 
-        # [R1] Persist state
-        self.state.on_position_open(pos, self._session_date)
+        # [R1] Persist state (including strategy meta, so a restart restores
+        # gap_dir etc. for exit detection)
+        self.state.on_position_open(pos, self._session_date, meta=signal.meta)
 
         ll.log_signal(
             strategy_id=signal.strategy_id, symbol=signal.symbol,
@@ -409,8 +423,8 @@ class Orchestrator:
             self._position_entry_bar.pop(trade_id, None)
             self._pending_verify.pop(trade_id, None)
             for strat in self.strategies.get(pos.symbol, []):
-                if strat.strategy_id == pos.strategy_id and strat._in_trade:
-                    strat._in_trade = False
+                if strat.strategy_id == pos.strategy_id and strat.in_trade:
+                    strat.clear_in_trade()
                     break
 
         # Cancel the unfilled entry order and its attached protective stop —
@@ -529,7 +543,7 @@ class Orchestrator:
         self.executor.send_exit(pos, exit_price, reason)
 
         for strat in self.strategies.get(pos.symbol, []):
-            if strat.strategy_id == pos.strategy_id and strat._in_trade:
+            if strat.strategy_id == pos.strategy_id and strat.in_trade:
                 try:
                     strat.on_exit(result_r, reason)
                 except Exception as e:
@@ -676,7 +690,7 @@ class Orchestrator:
 
         eod_safety_t = datetime.time.fromisoformat(config.EOD_SAFETY_AT)
         target = datetime.datetime.combine(today, eod_safety_t)
-        now    = datetime.datetime.now()
+        now    = _now_central()
         delay  = (target - now).total_seconds()
 
         if delay <= 0:
@@ -749,7 +763,7 @@ class Orchestrator:
         exceptions mid-transition.
         """
         # Only applies to strategies that expose a non-trivial state machine
-        state = getattr(strat, "_state", None)
+        state = strat.state_key
         if state is None or state == 0:  # 0 = WAIT_BREAK / WAIT_ENTRY — idle
             self._strat_transition_bar[sk] = bar_idx
             return
@@ -761,20 +775,16 @@ class Orchestrator:
                 f"{bar_idx - last_transition} bars — forcing reset"
             )
             try:
-                ctx = self._session_ctxs.get(strat.symbol)
-                if ctx:
-                    strat.reset_session(ctx)
-                else:
-                    strat._state = 0
+                strat.force_reset(self._session_ctxs.get(strat.symbol))
             except Exception as e:
                 log.error(f"Timeout reset failed for {strat}: {e}")
             self._strat_transition_bar[sk] = bar_idx
 
         # Update transition bar whenever state changes
-        prev_state = getattr(strat, "_prev_state_for_timeout", state)
+        prev_state = self._strat_prev_state.get(sk, state)
         if state != prev_state:
             self._strat_transition_bar[sk] = bar_idx
-        strat._prev_state_for_timeout = state
+        self._strat_prev_state[sk] = state
 
     # =========================================================================
     # SESSION MANAGEMENT
@@ -798,9 +808,12 @@ class Orchestrator:
         self._eod_closes       = 0
         self._max_sim          = 0
         self._bar_counters     = defaultdict(int)
-        self._seen_bars        = set()
+        # Keep dedup keys for THIS session (warm-up may have seeded today's
+        # bars); drop everything from previous sessions.
+        self._seen_bars        = {k for k in self._seen_bars if k[1] == session_date}
         self._session_vol      = defaultdict(float)
         self._strat_transition_bar.clear()
+        self._strat_prev_state.clear()
 
         if session_date == self._restored_session:
             # Restarted mid-session with today's state restored — keep the
@@ -884,7 +897,7 @@ class Orchestrator:
             time.sleep(_BACKOFF[min(backoff_idx, len(_BACKOFF) - 1)])
             backoff_idx += 1
 
-            now = datetime.datetime.now().time()
+            now = _now_central().time()
             if now >= _RECONNECT_GIVE_UP:
                 log.warning(f"Reconnect loop: past {_RECONNECT_GIVE_UP} local — giving up for today")
                 return
@@ -950,6 +963,7 @@ class Orchestrator:
 
     def warm_up(self, feed: IBKRFeed, days: int = 20):
         log.info(f"Warming up with {days} days of history...")
+        today_str = datetime.date.today().isoformat()
         for sym in self.all_symbols:
             try:
                 bars = feed.request_historical_bars(sym, duration=f"{days} D")
@@ -957,6 +971,11 @@ class Orchestrator:
                 for bar in bars:
                     self.ctx_builder.on_bar_close(bar)
                     _day_vol[bar.date] += bar.volume
+                    if bar.date == today_str:
+                        # Intraday start: today's bars are already in the
+                        # ctx_builder — seed the dedup set so a live re-emit
+                        # of the same bar can't double-count VWAP/volume.
+                        self._seen_bars.add((bar.symbol, bar.date, bar.time))
                     if bar.time == config.EOD_BAR:
                         self.ctx_builder.store_session_close(sym, bar.close)
                         self.ctx_builder.store_session_total_vol(sym, _day_vol[bar.date])

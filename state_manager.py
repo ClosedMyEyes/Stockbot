@@ -171,14 +171,14 @@ class StateManager:
 
     # ── Position tracking (called by orchestrator) ────────────────────────────
 
-    def on_position_open(self, pos, session_date: str) -> None:
-        """Record a new position and persist."""
+    def on_position_open(self, pos, session_date: str, meta: dict = None) -> None:
+        """Record a new position (with its strategy meta) and persist."""
         with self._lock:
             self._session = session_date
-            self._add_position_snapshot(pos)
+            self._add_position_snapshot(pos, meta)
             self.save()
 
-    def _add_position_snapshot(self, pos) -> None:
+    def _add_position_snapshot(self, pos, meta: dict = None) -> None:
         self._positions[pos.trade_id] = {
             "trade_id":    pos.trade_id,
             "symbol":      pos.symbol,
@@ -192,7 +192,7 @@ class StateManager:
             "entry_time":  pos.entry_time if hasattr(pos, "entry_time") else "",
             "stop_order_id": getattr(pos, "stop_order_id", None),
             "tp_order_id":   getattr(pos, "tp_order_id", None),
-            "meta":        getattr(pos, "meta", {}),
+            "meta":        meta if meta is not None else {},
         }
 
     def on_position_close(self, trade_id: str, result_r: float,
@@ -293,7 +293,7 @@ class StateManager:
                 # Re-mark strategy as in_trade
                 for strat in strategy_map.get(sym, []):
                     if strat.strategy_id == snap["strategy_id"]:
-                        strat._in_trade = True
+                        strat.mark_in_trade()
                         break
 
                 log.info(f"RECONCILE restored: {snap['strategy_id']}({sym}) "
@@ -334,10 +334,10 @@ class StateManager:
                 except Exception:
                     pass  # logging failure must never crash reconciliation
 
-                # Reset strategy _in_trade
+                # Reset strategy in_trade flag
                 for strat in strategy_map.get(sym, []):
                     if strat.strategy_id == snap["strategy_id"]:
-                        strat._in_trade = False
+                        strat.clear_in_trade()
                         break
 
                 self._positions.pop(trade_id, None)
