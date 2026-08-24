@@ -176,6 +176,7 @@ class StateManager:
             "R_dollars":   pos.R_dollars,
             "shares":      pos.shares,
             "entry_time":  pos.entry_time if hasattr(pos, "entry_time") else "",
+            "stop_order_id": getattr(pos, "stop_order_id", None),
             "meta":        getattr(pos, "meta", {}),
         }
         self.save()
@@ -255,6 +256,7 @@ class StateManager:
                     shares       = snap["shares"],
                     entry_time   = snap.get("entry_time", ""),
                     session_date = session_date,
+                    stop_order_id = snap.get("stop_order_id"),
                 )
                 risk_manager.restore_position(pos)
 

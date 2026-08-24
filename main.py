@@ -372,6 +372,13 @@ class Orchestrator:
 
     def _clear_failed_fill(self, trade_id: str, pos: OpenPosition):
         """Remove a position that completely failed to fill."""
+        # Cancel the unfilled entry order and its attached protective stop —
+        # otherwise the orphaned GTC stop could fire later and OPEN a position.
+        try:
+            self.executor.cancel_order(pos)
+        except Exception as e:
+            log.error(f"cancel_order failed for {trade_id}: {e}")
+
         self.risk.open_positions.pop(trade_id, None)
         self.state.on_position_close(trade_id, 0.0, 0.0)  # 0R, $0 — no fill
         self._positions_meta.pop(trade_id, None)
@@ -483,6 +490,40 @@ class Orchestrator:
                      exit_price: float, reason: str):
         """No-bar close path — used by EOD safety timer and reconnect recovery."""
         self._do_close(trade_id, pos, exit_price, reason, exit_time_str="16:00")
+
+    def _on_broker_stop_filled(self, trade_id: str, avg_price: float):
+        """
+        Called by IBKRExecution (on the ib event-loop thread) when a
+        broker-side protective stop fills. Records the exit through the normal
+        close path — the executor knows this trade_id already exited and will
+        not send a duplicate closing order.
+        """
+        pos = self.risk.open_positions.get(trade_id)
+        if pos is None:
+            return  # software path already closed it — nothing to record
+        exit_price = avg_price if avg_price else pos.stop
+        try:
+            import zoneinfo
+            now_et = datetime.datetime.now(
+                zoneinfo.ZoneInfo("America/New_York")).strftime("%H:%M")
+        except Exception:
+            now_et = datetime.datetime.now().strftime("%H:%M")
+        log.warning(
+            f"BROKER STOP filled: {pos.strategy_id}({pos.symbol}) "
+            f"trade_id={trade_id}  fill={exit_price:.4f}"
+        )
+        self._do_close(trade_id, pos, exit_price, "stopped (broker stop)", now_et)
+
+    def _ensure_broker_stops(self):
+        """After reconciliation: re-associate/re-place protective stops for
+        restored positions and cancel stops for departed ones (IBKR mode)."""
+        ex = self.executor
+        if ex is None or not hasattr(ex, "reconcile_stops"):
+            return
+        try:
+            ex.reconcile_stops(self.risk.get_open_positions())
+        except Exception as e:
+            log.error(f"reconcile_stops failed: {e}", exc_info=True)
 
     # =========================================================================
     # EOD [R5]
@@ -736,6 +777,7 @@ class Orchestrator:
                     f"Reconciliation: restored={restored} "
                     f"ghost_closed={ghosts} orphans={orphans}"
                 )
+                self._ensure_broker_stops()
             except Exception as e:
                 log.error(f"Reconciliation failed: {e}", exc_info=True)
 
@@ -836,10 +878,12 @@ class Orchestrator:
 
         if self.mode == "ibkr":
             self.executor = get_executor("ibkr", ib=feed._ib)
+            self.executor.on_stop_filled = self._on_broker_stop_filled
 
         # [R1] Startup reconciliation before warming up
         today = datetime.date.today().isoformat()
         self._startup_reconcile(feed, today)
+        self._ensure_broker_stops()
 
         self.warm_up(feed, days=warmup_days)
 

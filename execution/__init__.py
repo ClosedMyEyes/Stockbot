@@ -136,12 +136,34 @@ class IBKRExecution:
     Submits orders directly to IBKR via ib_insync placeOrder.
     Works with both paper and live IBKR accounts — the account type is
     determined by which TWS/Gateway the IB instance is connected to.
+
+    Every entry is a parent market order plus an attached GTC protective stop,
+    transmitted together, so open positions keep exchange-level protection
+    even if this process dies. The orchestrator's software exit detection
+    stays as a redundant layer:
+      - send_exit cancels the resting stop before placing the closing market
+        order (and skips the close entirely if the stop already filled)
+      - a broker-side stop fill is reported through `on_stop_filled(trade_id,
+        avg_price)` so the orchestrator records the exit without sending a
+        duplicate order
+      - reconcile_stops() re-associates or re-places stops after a restart,
+        and cancels stops whose position is gone (a forgotten GTC stop would
+        otherwise fire later and OPEN a position)
     """
+
+    # Stamped on every order we place; lets reconciliation recognise our
+    # orders at TWS across process restarts.
+    ORDER_REF_PREFIX = "stockbot:"
 
     def __init__(self, ib):
         self._ib = ib
-        self._trades: Dict[str, object] = {}   # trade_id -> ib Trade
-        self._contracts: Dict[str, object] = {}
+        self._trades: dict = {}        # trade_id -> parent (entry) ib Trade
+        self._stop_trades: dict = {}   # trade_id -> protective stop ib Trade
+        self._exited_by_stop: set = set()  # trade_ids already closed by their stop
+        self._contracts: dict = {}
+        # Set by the orchestrator: callback(trade_id, avg_fill_price) invoked
+        # on the ib event-loop thread when a protective stop fills.
+        self.on_stop_filled = None
 
     def _get_contract(self, symbol: str):
         if symbol not in self._contracts:
@@ -149,62 +171,215 @@ class IBKRExecution:
             self._contracts[symbol] = Stock(symbol, "SMART", "USD")
         return self._contracts[symbol]
 
-    def send_entry(self, pos: OpenPosition) -> bool:
-        from ib_insync import MarketOrder
-        action = "BUY" if pos.direction == "long" else "SELL"
+    def _run_on_loop(self, fn) -> None:
+        """Run fn on ib's event-loop thread (directly if already on it)."""
+        import asyncio
         try:
-            trade = self._ib.placeOrder(
-                self._get_contract(pos.symbol),
-                MarketOrder(action, pos.shares, tif='DAY'),
-            )
-            self._trades[pos.trade_id] = trade
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._ib.loop.call_soon_threadsafe(fn)
+        else:
+            fn()
+
+    def _ref(self, trade_id: str) -> str:
+        return f"{self.ORDER_REF_PREFIX}{trade_id}"
+
+    def _make_stop_fill_handler(self, trade_id: str):
+        def _on_filled(trade):
+            self._exited_by_stop.add(trade_id)
+            self._stop_trades.pop(trade_id, None)
+            price = getattr(trade.orderStatus, "avgFillPrice", 0.0) or 0.0
+            log.warning(f"[IBKR] protective stop FILLED  trade_id={trade_id}  avg={price}")
+            cb = self.on_stop_filled
+            if cb is not None:
+                try:
+                    cb(trade_id, price)
+                except Exception as e:
+                    log.error(f"[IBKR] on_stop_filled callback failed for {trade_id}: {e}",
+                              exc_info=True)
+        return _on_filled
+
+    def send_entry(self, pos: OpenPosition) -> bool:
+        from ib_insync import MarketOrder, StopOrder
+        action  = "BUY"  if pos.direction == "long" else "SELL"
+        reverse = "SELL" if pos.direction == "long" else "BUY"
+        # Stops are computed with fractional slippage buffers; IBKR rejects
+        # sub-penny prices on stocks >= $1, so round to cents.
+        stop_price = round(pos.stop, 2)
+        try:
+            contract = self._get_contract(pos.symbol)
+            parent = MarketOrder(action, pos.shares, tif='DAY',
+                                 orderRef=self._ref(pos.trade_id), transmit=False)
+            parent_trade = self._ib.placeOrder(contract, parent)
+            try:
+                stop = StopOrder(reverse, pos.shares, stop_price, tif='GTC',
+                                 parentId=parent_trade.order.orderId,
+                                 orderRef=self._ref(pos.trade_id), transmit=True)
+                stop_trade = self._ib.placeOrder(contract, stop)
+            except Exception:
+                # Child failed after parent was placed (untransmitted) — don't
+                # leave the inert parent sitting at TWS.
+                try:
+                    self._ib.cancelOrder(parent_trade.order)
+                except Exception:
+                    pass
+                raise
+
+            self._trades[pos.trade_id]      = parent_trade
+            self._stop_trades[pos.trade_id] = stop_trade
+            stop_trade.filledEvent += self._make_stop_fill_handler(pos.trade_id)
+            pos.stop_order_id = stop_trade.order.orderId
+
             log.info(
                 f"[IBKR] ENTRY {action} {pos.symbol} {pos.shares}sh @ market  "
-                f"stop={pos.stop:.4f}  tp={pos.tp:.4f}  orderId={trade.order.orderId}"
+                f"+ GTC stop {reverse} @ {stop_price:.2f}  tp={pos.tp:.4f}  "
+                f"orderId={parent_trade.order.orderId} stopId={stop_trade.order.orderId}"
             )
             return True
         except Exception as e:
             log.error(f"[IBKR] placeOrder entry failed for {pos.symbol}: {e}")
             return False
 
+    def _cancel_protective_stop(self, trade_id: str):
+        """Cancel the resting GTC stop for this trade, if any.
+        Returns the stop Trade when it turns out to have already FILLED
+        (the position is gone — the caller must not send a closing order)."""
+        stop_trade = self._stop_trades.pop(trade_id, None)
+        if stop_trade is None:
+            return None
+        if getattr(stop_trade.orderStatus, "status", "") == "Filled":
+            self._exited_by_stop.add(trade_id)
+            return stop_trade
+        try:
+            self._ib.cancelOrder(stop_trade.order)
+            log.info(f"[IBKR] cancelled protective stop  trade_id={trade_id}")
+        except Exception as e:
+            log.error(f"[IBKR] cancel protective stop failed for {trade_id}: {e}")
+        return None
+
     def send_exit(self, pos: OpenPosition, exit_price: float, reason: str) -> bool:
-        import asyncio
         from ib_insync import MarketOrder
+
+        if pos.trade_id in self._exited_by_stop:
+            # Position was already closed by the broker-side stop — the
+            # orchestrator is just recording the exit. No order to send.
+            self._exited_by_stop.discard(pos.trade_id)
+            self._trades.pop(pos.trade_id, None)
+            log.info(f"[IBKR] EXIT already done by broker stop: {pos.symbol}  ({reason})")
+            return True
+
         action   = "SELL" if pos.direction == "long" else "BUY"
         contract = self._get_contract(pos.symbol)
-        order    = MarketOrder(action, pos.shares, tif='DAY')
+        order    = MarketOrder(action, pos.shares, tif='DAY',
+                               orderRef=self._ref(pos.trade_id))
         label    = f"[IBKR] EXIT {action} {pos.symbol} {pos.shares}sh @ market  ({reason})"
 
         def _place():
             try:
+                # Cancel the resting stop FIRST — otherwise it can fill after
+                # our market close and flip the position.
+                already_filled = self._cancel_protective_stop(pos.trade_id)
+                if already_filled is not None:
+                    log.warning(
+                        f"[IBKR] EXIT skipped for {pos.symbol}: protective stop "
+                        f"already filled — no closing order sent  ({reason})"
+                    )
+                    return
                 self._ib.placeOrder(contract, order)
                 log.info(label)
             except Exception as e:
                 log.error(f"[IBKR] placeOrder exit failed for {pos.symbol}: {e}")
 
-        try:
-            asyncio.get_running_loop()
-            # On the ib event-loop thread — call directly.
-            _place()
-        except RuntimeError:
-            # Called from a non-event-loop thread (e.g. EOD safety timer).
-            # Schedule onto ib's event loop so placeOrder has its event loop context.
-            self._ib.loop.call_soon_threadsafe(_place)
-            log.info(f"[IBKR] EXIT queued on event loop: {action} {pos.symbol} {pos.shares}sh  ({reason})")
+        self._run_on_loop(_place)
+        self._trades.pop(pos.trade_id, None)
         return True
 
     def cancel_order(self, pos: OpenPosition) -> bool:
-        trade = self._trades.pop(pos.trade_id, None)
-        if trade is None:
-            log.warning(f"[IBKR] cancel_order: no tracked entry order for {pos.symbol}")
-            return False
-        try:
-            self._ib.cancelOrder(trade.order)
-            log.info(f"[IBKR] CANCEL {pos.symbol}")
-            return True
-        except Exception as e:
-            log.error(f"[IBKR] cancelOrder failed for {pos.symbol}: {e}")
-            return False
+        """Cancel the tracked entry order AND its protective stop.
+        Used when fill verification finds the entry never filled."""
+        def _cancel():
+            self._cancel_protective_stop(pos.trade_id)
+            trade = self._trades.pop(pos.trade_id, None)
+            if trade is None:
+                log.warning(f"[IBKR] cancel_order: no tracked entry order for {pos.symbol}")
+                return
+            try:
+                self._ib.cancelOrder(trade.order)
+                log.info(f"[IBKR] CANCEL {pos.symbol}")
+            except Exception as e:
+                log.error(f"[IBKR] cancelOrder failed for {pos.symbol}: {e}")
+
+        self._run_on_loop(_cancel)
+        return True
+
+    def reconcile_stops(self, positions) -> None:
+        """
+        Call after every (re)connect + state reconciliation, with the list of
+        restored open positions:
+          - each position is re-associated with its resting GTC stop at TWS
+            (matched by stop_order_id, else by our orderRef); if none is
+            found, a fresh GTC stop is placed and a WARNING logged
+          - any of our stops whose trade_id has no open position is cancelled
+        Runs on the ib event-loop thread; safe to call from any thread.
+        """
+        positions = list(positions)
+
+        def _reconcile():
+            from ib_insync import StopOrder
+            try:
+                open_trades = list(self._ib.openTrades())
+            except Exception as e:
+                log.error(f"[IBKR] reconcile_stops: openTrades() failed: {e}")
+                return
+
+            by_id = {t.order.orderId: t for t in open_trades}
+            ours  = {}
+            for t in open_trades:
+                ref = getattr(t.order, "orderRef", "") or ""
+                if ref.startswith(self.ORDER_REF_PREFIX) and t.order.orderType == "STP":
+                    ours[ref[len(self.ORDER_REF_PREFIX):]] = t
+
+            live_ids = set()
+            for pos in positions:
+                tid = pos.trade_id
+                live_ids.add(tid)
+                stop_trade = by_id.get(getattr(pos, "stop_order_id", None)) \
+                             or ours.get(tid)
+                if stop_trade is not None:
+                    self._stop_trades[tid] = stop_trade
+                    stop_trade.filledEvent += self._make_stop_fill_handler(tid)
+                    pos.stop_order_id = stop_trade.order.orderId
+                    log.info(f"[IBKR] re-associated protective stop  trade_id={tid}  "
+                             f"stopId={stop_trade.order.orderId}")
+                    continue
+                # No live stop at IBKR — re-place it (no parent: position exists)
+                reverse = "SELL" if pos.direction == "long" else "BUY"
+                try:
+                    st = StopOrder(reverse, pos.shares, round(pos.stop, 2),
+                                   tif='GTC', orderRef=self._ref(tid))
+                    t = self._ib.placeOrder(self._get_contract(pos.symbol), st)
+                    self._stop_trades[tid] = t
+                    t.filledEvent += self._make_stop_fill_handler(tid)
+                    pos.stop_order_id = t.order.orderId
+                    log.warning(
+                        f"[IBKR] restored position {pos.symbol} trade_id={tid} had "
+                        f"NO live protective stop — re-placed GTC stop @ {round(pos.stop, 2):.2f}"
+                    )
+                except Exception as e:
+                    log.error(f"[IBKR] re-placing protective stop failed for {tid}: {e}")
+
+            for tid, t in ours.items():
+                if tid not in live_ids and tid not in self._stop_trades:
+                    try:
+                        self._ib.cancelOrder(t.order)
+                        log.warning(
+                            f"[IBKR] cancelled orphaned protective stop for departed "
+                            f"trade {tid} ({t.contract.symbol}) — position no longer open"
+                        )
+                    except Exception as e:
+                        log.error(f"[IBKR] cancelling orphaned stop {tid} failed: {e}")
+
+        self._run_on_loop(_reconcile)
 
 
 # =============================================================================
@@ -281,5 +456,10 @@ def get_executor(mode: str = "paper", ib=None):
         return IBKRExecution(ib)
     if mode == "signalstack":
         log.info("Execution mode: SIGNALSTACK (live webhook)")
+        log.warning(
+            "SignalStack webhooks are market-only — no broker-side protective "
+            "stops. Open positions are SOFTWARE-protected only: if this process "
+            "dies mid-trade, they have no exchange-level stop."
+        )
         return SignalStackExecution()
     raise ValueError(f"Unknown execution mode {mode!r} — choose paper, ibkr, or signalstack")

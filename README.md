@@ -67,9 +67,14 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
     │
     ├── Executor  (execution/__init__.py — three modes)
     │     • PaperExecution        logs only, instant simulated fills
-    │     • IBKRExecution         direct ib_insync placeOrder MarketOrder;
-    │                             thread-safe exit path via call_soon_threadsafe
-    │                             when invoked off the event loop (EOD timer)
+    │     • IBKRExecution         parent MarketOrder + attached GTC StopOrder
+    │                             (broker-side protection, transmitted together);
+    │                             software exits cancel the resting stop before
+    │                             closing; broker stop fills are routed back via
+    │                             on_stop_filled so no duplicate close is sent;
+    │                             reconcile_stops() re-places/re-associates stops
+    │                             after restarts; thread-safe via
+    │                             call_soon_threadsafe off the event loop
     │     • SignalStackExecution  queued webhook worker thread with a shared
     │                             2-calls-per-60s rate limiter (prop-firm cap);
     │                             never blocks the bar callback
@@ -91,12 +96,16 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
 | `--ibkr` (default) | IBKRExecution      | Direct `placeOrder` market orders to whichever TWS/Gateway you're connected to (paper account on 7497, live on 7496). |
 | `--live`         | SignalStackExecution | HTTP webhook → SignalStack → broker. Prompts for confirmation. Rate-limited to 2 actions/60s. |
 
-> ⚠️ **All modes send market orders on ENTRY only.** Stops and targets are
-> monitored in software off 1-min bars and exited with a market order when
-> breached. There are currently **no broker-side stop/bracket orders** — if the
-> orchestrator process dies mid-trade and fails to reconnect, open positions
-> have no exchange-level protection. See "Known limitations" below. This is the
-> top item on the fix list.
+> ⚠️ **Exit management:** in `--ibkr` mode every entry is a parent market
+> order plus an attached **GTC protective stop resting at the broker**, so a
+> dead process no longer leaves positions unprotected. Software exit detection
+> stays as a redundant layer: it cancels the resting stop before sending a
+> closing order, and a broker-side stop fill is routed back so no duplicate
+> close is ever sent. Targets (TP) are still software-monitored only.
+> `--live` (SignalStack) is market-only — those positions remain
+> **software-protected only** (a startup WARNING says so). The `--ibkr` stop
+> flow is unit-tested against a mocked IBKR but still needs one live
+> verification session against paper TWS (see Known limitations).
 
 ---
 
@@ -104,7 +113,7 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
 
 | Failure mode                       | How it's handled                                                                                                          |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Crash / kill -9                    | `logs/state.json` written atomically on every position change. On restart, reconcile vs IBKR positions before any new signals. (Caveat: restored daily P&L/halt status is wiped again on the first bar — see Known limitations.) |
+| Crash / kill -9                    | `logs/state.json` written atomically on every position change. On restart, reconcile vs IBKR positions before any new signals; in `--ibkr` mode the GTC protective stop keeps resting at the broker while the process is down, and reconciliation re-associates it (or re-places it with a WARNING if it's gone). (Caveat: restored daily P&L/halt status is wiped again on the first bar — see Known limitations.) |
 | IBKR disconnect mid-trade          | Reconnect loop with exponential backoff (5s → 10s → 20s → … → 300s) in a daemon thread. On reconnect, state is reconciled before resubscribing bars. Gives up at 15:35 CT (16:35 ET). |
 | Position closed while disconnected | Detected at reconcile: `ib.fills()` queried for the actual exit fill, logged as "disconnected exit" (falls back to entry price / 0R if no fill is found), strategy state cleared. |
 | Orphan position (not in our state) | Logged as WARNING. Never touched automatically — requires manual review.                                                  |
@@ -298,7 +307,7 @@ print(live_gfl["result_R"].describe())
 
 | Item                        | Status                                                                                                                    |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| **Broker-side stop orders** | **Not done — highest priority.** All exits are software-managed. IBKRExecution should attach a GTC stop (ideally a bracket) on entry so IBKR protects positions even if the orchestrator is down. |
+| ~~Broker-side stop orders~~ | **Fixed 2026-08-23** (`--ibkr` mode). Entries now transmit a parent market order + attached GTC stop; software exits cancel-before-close; broker stop fills route back through `on_stop_filled` (logged as "stopped (broker stop)" with the actual fill price); reconciliation re-associates or re-places stops and cancels orphaned ones. Covered by `tests/test_ibkr_stops.py` (mocked IBKR). **Remaining:** one live paper-TWS session to verify end-to-end (enter trade → kill bot → stop still resting in TWS → restart → stop re-associated); TP is still software-only (no OCA bracket); SignalStack mode remains software-protected only. |
 | ~~Group B feed emits partial bars~~ | **Fixed 2026-08-23.** Symbols 91+ (fed via `reqHistoricalData(keepUpToDate=True)`) now emit `bars[-2]` — the completed bar — on `hasNewBar`, instead of the newly started partial bar, with a same-date guard so a pre-market snapshot's last bar isn't re-fed. Covered by `tests/test_feed_ku.py`. Still worth eyeballing one live session against a TWS chart. |
 | ~~Stale SessionContext at session rollover~~ | **Fixed 2026-08-23.** Strategies are now reset lazily on their own symbol's first bar of the session (with that symbol's fresh context), not en masse at global rollover with stale contexts. Gap `prior_close` and orb_short's weekday filters now see the correct session. Covered by `tests/test_session_reset.py` (the main test fails against the old code). |
 | Restart wipes restored session state | `_on_new_session()` resets daily P&L/halts and clears state.json's position list right after startup reconciliation restored them (details in "State file" above). |

@@ -48,6 +48,10 @@ class OpenPosition:
     entry_time:    str
     session_date:  str
     entry_bar_i:   int = 0
+    # IBKR mode: orderId of the broker-side GTC protective stop attached on
+    # entry. Persisted to state.json so reconciliation after a restart can
+    # re-associate (or re-place) the stop.
+    stop_order_id: Optional[int] = None
 
 
 @dataclass
