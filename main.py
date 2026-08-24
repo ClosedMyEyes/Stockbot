@@ -377,6 +377,13 @@ class Orchestrator:
                 live.R_dollars = actual * abs(live.entry_price - live.stop)
                 r_dollars = live.R_dollars
             self.state.on_shares_adjusted(tid, actual, r_dollars)
+            # Resize the resting broker-side stop/TP to the actual share
+            # count — a child at the old quantity would over-close and flip.
+            if hasattr(self.executor, "adjust_children_quantity"):
+                try:
+                    self.executor.adjust_children_quantity(tid, actual)
+                except Exception as e:
+                    log.error(f"adjust_children_quantity failed for {tid}: {e}")
 
         else:
             log.info(f"FillVerify {tid} ({pos.symbol}): OK — {actual} shares confirmed")

@@ -1,5 +1,9 @@
 # Trading Bot Orchestrator
 
+> 📋 **Owner checklist:** see [OWNER-CHECKLIST.md](OWNER-CHECKLIST.md) for the
+> things the bot still needs from **you** — the live TWS verification, the
+> market-data-line check, and one EOD-timing decision.
+
 Central hub for 6 intraday trading strategy modules. Feeds live 1-min bars from
 IBKR into each strategy, routes signals through per-strategy and portfolio-level
 risk management with daily regime-based sizing, fires orders via direct IBKR

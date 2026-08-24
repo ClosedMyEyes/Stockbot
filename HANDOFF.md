@@ -358,11 +358,22 @@ DONE (in working tree, not yet committed):
     * subscribe_bars logs a WARNING when >100 streaming subscriptions are
       requested (default IBKR market-data entitlement).
 
-STILL OPEN (operational only, needs the user/TWS):
-  - live paper-TWS verification of the bracket flow (enter → kill bot →
-    stop+TP resting → restart → children re-associated)
-  - confirm the IBKR account's market-data line entitlement covers 164
-    symbols (or trim universes)
+  - 2026-08-23 (post-list deep pass):
+    * Partial-fill child resize: adjust_children_quantity() shrinks the
+      resting stop/TP to the actually-held shares after a partial entry
+      fill — a child at the original quantity would over-close and FLIP the
+      position. Wired into _verify_fill_async, tested.
+    * FOUND, awaiting owner decision (OWNER-CHECKLIST.md §3): the 15:59 bar
+      never emits on either feed path (a completed bar needs a successor
+      bar; RTH data ends at 16:00), so EOD closes fall to the 16:01 ET
+      safety timer — and IBKR treats post-close market orders as NEXT-DAY
+      orders → unintended overnight holds. Recommendation: close on the
+      last real bar (~15:59:00 ET) + backstop at 15:59:30 ET.
+
+STILL OPEN (needs the owner — full detail in OWNER-CHECKLIST.md):
+  - live paper-TWS verification of the bracket flow
+  - market-data line entitlement check (164 symbols vs default 100)
+  - EOD close-timing decision (above)
 
 NOTE: this repo copy of HANDOFF.md is now the living document; the copy in
 C:\Users\mark\Downloads is stale and can be deleted.

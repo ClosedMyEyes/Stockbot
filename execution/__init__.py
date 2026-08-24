@@ -365,6 +365,26 @@ class IBKRExecution:
         self._trades.pop(pos.trade_id, None)
         return True
 
+    def adjust_children_quantity(self, trade_id: str, new_shares: int) -> None:
+        """After a partial entry fill: resize the resting stop/TP children to
+        the actually-held share count. Without this, a child fill would
+        over-close the position and flip it into an unintended reverse
+        position. Modification = re-placeOrder with the same orderId."""
+        def _adjust():
+            for book, what in ((self._stop_trades, "protective stop"),
+                               (self._tp_trades, "take-profit")):
+                t = book.get(trade_id)
+                if t is None or getattr(t.orderStatus, "status", "") == "Filled":
+                    continue
+                try:
+                    t.order.totalQuantity = new_shares
+                    self._ib.placeOrder(t.contract, t.order)
+                    log.info(f"[IBKR] resized {what} to {new_shares}sh  "
+                             f"trade_id={trade_id}")
+                except Exception as e:
+                    log.error(f"[IBKR] resize {what} failed for {trade_id}: {e}")
+        self._run_on_loop(_adjust)
+
     def cancel_order(self, pos: OpenPosition) -> bool:
         """Cancel the tracked entry order AND its bracket children.
         Used when fill verification finds the entry never filled."""

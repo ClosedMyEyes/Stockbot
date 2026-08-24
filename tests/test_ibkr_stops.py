@@ -283,6 +283,37 @@ def test_failed_fill_cancels_entry_and_children(ex):
     assert parent_order in ib.cancelled
 
 
+def test_partial_fill_resizes_children(ex):
+    """A partial entry fill must shrink the resting stop/TP — a child at the
+    original quantity would over-close and flip the position."""
+    executor, ib = ex
+    pos = _make_pos(shares=67)
+    executor.send_entry(pos)
+    stop_order, tp_order = ib.placed[1].order, ib.placed[2].order
+    stop_id, tp_id = stop_order.orderId, tp_order.orderId
+
+    executor.adjust_children_quantity("t1", 50)
+
+    assert stop_order.totalQuantity == 50
+    assert tp_order.totalQuantity == 50
+    # modified via re-placeOrder with the SAME orderIds
+    assert [t.order.orderId for t in ib.placed[-2:]] == [stop_id, tp_id]
+
+
+def test_resize_skips_filled_child(ex):
+    executor, ib = ex
+    pos = _make_pos(shares=67)
+    executor.send_entry(pos)
+    ib.placed[1].orderStatus.status = "Filled"     # stop already filled
+    n_before = len(ib.placed)
+
+    executor.adjust_children_quantity("t1", 50)
+
+    assert ib.placed[1].order.totalQuantity == 67  # filled stop untouched
+    assert ib.placed[2].order.totalQuantity == 50  # TP resized
+    assert len(ib.placed) == n_before + 1          # only one modification sent
+
+
 def test_clear_failed_fill_calls_executor_cancel(orchestrator, monkeypatch):
     orch = orchestrator
     cancelled = []
