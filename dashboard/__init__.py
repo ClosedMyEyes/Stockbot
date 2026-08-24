@@ -6,9 +6,8 @@ Three views:
   TRADES  — every completed trade this session (reads trade_log.csv)
   HISTORY — daily summary across all sessions (reads daily_summary.csv)
 
-Run alongside the orchestrator:
-  from orchestrator.dashboard import start_dashboard
-  start_dashboard(orchestrator)
+Started automatically by Orchestrator.run() when config.DASHBOARD_ENABLE is
+True (daemon thread — a dashboard crash can never take down trading).
 
 Access at http://localhost:8050
 """
@@ -32,18 +31,25 @@ _ORCHESTRATOR = None
 
 
 def start_dashboard(orch, port: int = None):
+    """Start the dashboard HTTP server on a daemon thread. Returns the
+    HTTPServer (its .server_address carries the bound port — pass port=0
+    for an ephemeral one in tests)."""
     global _ORCHESTRATOR
     _ORCHESTRATOR = orch
-    port = port or config.DASHBOARD_PORT
+    if port is None:
+        port = config.DASHBOARD_PORT
+
+    # Bind loopback only — this is a local monitor with no auth; exposing it
+    # on all interfaces would leak positions/P&L to the network.
+    server = HTTPServer(("127.0.0.1", port), DashboardHandler)
 
     def serve():
-        server = HTTPServer(("0.0.0.0", port), DashboardHandler)
-        log.info(f"Dashboard running at http://localhost:{port}")
+        log.info(f"Dashboard running at http://localhost:{server.server_address[1]}")
         server.serve_forever()
 
     t = threading.Thread(target=serve, daemon=True, name="dashboard")
     t.start()
-    return t
+    return server
 
 
 # =============================================================================
@@ -90,7 +96,12 @@ def _build_status() -> dict:
         return {"error": "orchestrator not connected"}
     orch = _ORCHESTRATOR
     risk = orch.risk
-    risk_sum = risk.summary()
+    # summary() iterates open_positions, which other threads mutate — take the
+    # orchestrator's position lock. Lazy import: main is already loaded by the
+    # time the dashboard starts, this just avoids a circular import at load.
+    from .. import main as _main
+    with _main._position_lock:
+        risk_sum = risk.summary()
 
     # Per-strategy status enriched with config targets
     strategy_rows = []

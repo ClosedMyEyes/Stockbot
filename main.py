@@ -96,6 +96,13 @@ class Orchestrator:
         self._session_date: str  = ""
         self._session_ctxs: Dict[str, SessionContext] = {}
         self._session_open: bool = False
+        # Set by _startup_reconcile when state.json from TODAY was restored —
+        # _on_new_session must then keep the restored daily P&L / halts /
+        # positions instead of resetting the day.
+        self._restored_session: str = ""
+        # Today's regime payload, pre-fetched in run() so the first bar of the
+        # session doesn't block the bar thread on a network download.
+        self._regime_payload: Optional[dict] = None
         # Per-symbol strategy reset tracking: symbol → session date it was
         # last reset for. Strategies are reset lazily on their own symbol's
         # first bar of the session, AFTER SessionContextBuilder has built that
@@ -169,11 +176,19 @@ class Orchestrator:
         # with its own fresh context (see _strat_session comment in __init__)
         if self._strat_session.get(bar.symbol) != bar.date:
             self._strat_session[bar.symbol] = bar.date
+            with _position_lock:
+                held = {p.strategy_id for p in self.risk.open_positions.values()
+                        if p.symbol == bar.symbol}
             for strat in self.strategies.get(bar.symbol, []):
                 try:
                     strat.reset_session(ctx)
                 except Exception as e:
                     log.error(f"reset_session error [{strat}]: {e}", exc_info=True)
+                if strat.strategy_id in held:
+                    # Position restored after a mid-session restart —
+                    # reset_session cleared the flag; re-mark it so the
+                    # strategy can't signal a duplicate entry.
+                    strat._in_trade = True
 
         # Track last known close price and accumulated volume (used by EOD routines)
         self._last_close[bar.symbol] = bar.close
@@ -457,14 +472,29 @@ class Orchestrator:
         if tp_hit:
             return tp, "TP hit"
 
+        # Hold-time cap (config STRATEGY_PARAMS, 0 = disabled). Checked after
+        # stop/TP so price-based exits take precedence within a bar.
+        hold_cap = config.STRATEGY_PARAMS.get(pos.strategy_id, {}).get("hold_cap_bars", 0)
+        if hold_cap and hold_cap > 0:
+            bars_held = (self._bar_counters.get(pos.symbol, 0)
+                         - self._position_entry_bar.get(pos.trade_id, 0))
+            if bars_held >= hold_cap:
+                return bar.close, "hold cap"
+
         return None, None
 
     def _do_close(self, trade_id: str, pos: OpenPosition,
-                  exit_price: float, reason: str, exit_time_str: str):
+                  exit_price: float, reason: str, exit_time_str: str,
+                  exit_fill_price: float = None,
+                  exit_trigger_price: float = None):
         """
         Shared close path — called by both _close_position (has a live bar)
         and _force_close (EOD timer / no-bar callers).
         Fires executor.send_exit, writes ll.log_trade, updates state.json.
+
+        exit_fill_price / exit_trigger_price: set by the broker-stop path,
+        where the actual fill is already known at close time — logged as
+        extra columns (software exits get their fill via fill_log.csv later).
         """
         # close_position is the atomic ownership test (pops the position);
         # the side-dict pops ride in the same critical section. Everything
@@ -495,10 +525,18 @@ class Orchestrator:
 
         bars_held = self._bar_counters.get(pos.symbol, 0) - entry_bar
 
+        slippage_r = None
+        if exit_fill_price is not None and exit_trigger_price is not None:
+            risk_ps = abs(pos.entry_price - pos.stop)
+            if risk_ps > 0:
+                dir_mult = 1 if pos.direction == "long" else -1
+                slippage_r = (exit_fill_price - exit_trigger_price) * dir_mult / risk_ps
+
         ll.log_trade(
             pos=pos, exit_price=exit_price, exit_time=exit_time_str,
             exit_reason=reason, result_r=result_r, bars_to_exit=bars_held,
             meta=meta,
+            exit_fill_price=exit_fill_price, slippage_r=slippage_r,
         )
 
         # [R1] Persist updated state
@@ -539,7 +577,26 @@ class Orchestrator:
             f"BROKER STOP filled: {pos.strategy_id}({pos.symbol}) "
             f"trade_id={trade_id}  fill={exit_price:.4f}"
         )
-        self._do_close(trade_id, pos, exit_price, "stopped (broker stop)", now_et)
+        ll.log_fill(trade_id, "stop", pos.symbol, avg_price)
+        self._do_close(trade_id, pos, exit_price, "stopped (broker stop)", now_et,
+                       exit_fill_price=exit_price, exit_trigger_price=pos.stop)
+
+    def _on_entry_filled(self, trade_id: str, avg_price: float):
+        """Broker reported the entry order's average fill (ib event thread)."""
+        with _position_lock:
+            pos = self.risk.open_positions.get(trade_id)
+            if pos is not None:
+                pos.entry_fill_price = avg_price
+                symbol = pos.symbol
+            else:
+                symbol = ""
+        ll.log_fill(trade_id, "entry", symbol, avg_price)
+
+    def _on_exit_filled(self, trade_id: str, avg_price: float):
+        """Broker reported a closing order's average fill (ib event thread).
+        The trade row was already written at trigger time — the actual fill
+        lands in fill_log.csv, joined on trade_id during analysis."""
+        ll.log_fill(trade_id, "exit", "", avg_price)
 
     def _ensure_broker_stops(self):
         """After reconciliation: re-associate/re-place protective stops for
@@ -712,17 +769,31 @@ class Orchestrator:
         self._bar_counters     = defaultdict(int)
         self._seen_bars        = set()
         self._session_vol      = defaultdict(float)
-        self._positions_meta.clear()
-        self._position_entry_bar.clear()
-        self._pending_verify.clear()
         self._strat_transition_bar.clear()
 
-        self.risk.reset_day(session_date)
-        self.state.clear_session()
+        if session_date == self._restored_session:
+            # Restarted mid-session with today's state restored — keep the
+            # restored daily P&L / halts / open positions and their meta so
+            # the loss-limit circuit breakers actually survive restarts.
+            log.info("Session matches restored state — keeping daily P&L, "
+                     "halts, and restored open positions")
+        else:
+            self._positions_meta.clear()
+            self._position_entry_bar.clear()
+            self._pending_verify.clear()
+            self.risk.reset_day(session_date)
+            self.state.clear_session()
         self._post_market_done = False  # reset guard for new session
 
-        # Load today's regime and apply scale factors to risk sizing + max_dd
-        regime_payload = load_for_session()
+        # Regime scales: use the pre-fetched payload when it's from today,
+        # otherwise download now. load_for_session() never raises — it falls
+        # back to 1.0x scales on any failure.
+        if self._regime_payload and self._regime_payload.get("date") == session_date:
+            regime_payload = self._regime_payload
+            log.info("Using pre-fetched regime payload")
+        else:
+            regime_payload = load_for_session()
+            self._regime_payload = regime_payload
         self.risk.apply_regime_scales(regime_payload["scales"])
 
         # [R5] Schedule EOD safety timer
@@ -874,6 +945,7 @@ class Orchestrator:
             return False
 
         log.info(f"Found today's state file — reconciling with IBKR")
+        self._restored_session = today   # _on_new_session must not reset the day
         self.state.restore_from_dict(saved)
         with _position_lock:
             restored, ghosts, orphans = self.state.reconcile(
@@ -915,12 +987,18 @@ class Orchestrator:
 
         if self.mode == "ibkr":
             self.executor = get_executor("ibkr", ib=feed._ib)
-            self.executor.on_stop_filled = self._on_broker_stop_filled
+            self.executor.on_stop_filled  = self._on_broker_stop_filled
+            self.executor.on_entry_filled = self._on_entry_filled
+            self.executor.on_exit_filled  = self._on_exit_filled
 
         # [R1] Startup reconciliation before warming up
         today = datetime.date.today().isoformat()
         self._startup_reconcile(feed, today)
         self._ensure_broker_stops()
+
+        # Pre-fetch today's regime while still pre-market so the session's
+        # first bar doesn't block the bar thread on the yfinance download.
+        self._regime_payload = load_for_session()
 
         self.warm_up(feed, days=warmup_days)
 
@@ -930,6 +1008,15 @@ class Orchestrator:
         # Assign bar callback BEFORE subscribe
         feed.on_bar = self.on_bar
         feed.subscribe_bars()
+
+        # Dashboard (optional) — daemon thread; a dashboard failure must
+        # never take down trading.
+        if getattr(config, "DASHBOARD_ENABLE", False):
+            try:
+                from .dashboard import start_dashboard
+                start_dashboard(self)
+            except Exception as e:
+                log.error(f"Dashboard failed to start (trading unaffected): {e}")
 
         log.info("Orchestrator live. Listening for bars...")
         try:

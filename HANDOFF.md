@@ -300,11 +300,34 @@ DONE (in working tree, not yet committed):
           state.json / daily-stats P&L now agrees with the risk manager's
           shares-based P&L.
 
-STILL OPEN: P0-3 (dashboard rename/wire), P1-1 (fill-price logging),
-P1-3 (hold cap), P1-5 (restart wipe), P2-3/P2-4/P2-5, remaining P2-6 items
-(conflict log, market-data lines check, regime pre-fetch, warm-up/live
-dedup overlap). Plus: live paper-TWS verification of P0-1 once TWS is
-installed.
+  - P0-3  dashboard: renamed dashboard__init__.py → __init__.py (git mv),
+          started by run() behind config.DASHBOARD_ENABLE on a daemon thread
+          (crash-isolated), binds 127.0.0.1 only, position lock taken around
+          risk.summary(). Module was fully compatible — no rewrite needed.
+  - P1-1  fill logging: entry/exit market orders report avg fills via
+          filledEvent → on_entry_filled / on_exit_filled. Design choice:
+          result_R stays TRIGGER-based (backtest comparability + halt
+          calibration); actual fills recorded as appended trade_log columns
+          (entry_fill_price, exit_fill_price, slippage_r — exit fill inline
+          for broker-stop closes where it's known at close time) plus a
+          complete fill_log.csv to join on trade_id. Flagged to owner: can
+          be flipped to fill-based result_R later if preferred.
+  - P1-3  hold cap: _detect_exit honors hold_cap_bars (bar-close exit,
+          "hold cap" reason, stop/TP precedence). All params still 0.
+          hold_cap_exit_r left unwired — its backtest semantics were lost
+          with the old PC; owner to clarify before enabling.
+  - P1-5  restart wipe: _on_new_session is restart-aware (keeps restored
+          daily P&L/halts/positions/meta when the session matches the
+          restored state's date); lazy per-symbol reset re-marks _in_trade
+          for symbols with restored open positions.
+  - P2-6  conflict log now written from RiskManager.approve; regime payload
+          pre-fetched in run() and reused at session open.
+
+STILL OPEN: P2-3 (encapsulation), P2-4 (timezone robustness), P2-5 (meta
+persistence), P2-6 remainder (market-data lines entitlement check, warm-up/
+live dedup overlap — both operational/minor). Plus: live paper-TWS
+verification of P0-1 once TWS is installed, and the hold_cap_exit_r
+semantics question for the owner.
 
 NOTE: this repo copy of HANDOFF.md is now the living document; the copy in
 C:\Users\mark\Downloads is stale and can be deleted.

@@ -15,6 +15,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Set
 from ..models import Signal, OpenPosition
 from .. import config
+from .. import logging_layer as ll
 
 log = logging.getLogger("risk")
 
@@ -92,6 +93,15 @@ class RiskManager:
                 f"CONFLICT [{strat_id} {signal.symbol}] — "
                 f"already held by {conflict.strategy_id} (priority ordering)"
             )
+            try:
+                ll.log_conflict(
+                    session=signal.session_date, bar_time=signal.bar_time,
+                    winner_strategy=conflict.strategy_id,
+                    loser_strategy=strat_id,
+                    symbol=signal.symbol, conflict_type="same_symbol",
+                )
+            except Exception:
+                pass  # logging must never block a risk decision
             return None
 
         # Per-strategy risk sizing (scaled by today's regime factor)

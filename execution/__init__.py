@@ -161,9 +161,11 @@ class IBKRExecution:
         self._stop_trades: dict = {}   # trade_id -> protective stop ib Trade
         self._exited_by_stop: set = set()  # trade_ids already closed by their stop
         self._contracts: dict = {}
-        # Set by the orchestrator: callback(trade_id, avg_fill_price) invoked
-        # on the ib event-loop thread when a protective stop fills.
-        self.on_stop_filled = None
+        # Set by the orchestrator: callbacks (trade_id, avg_fill_price)
+        # invoked on the ib event-loop thread when the respective order fills.
+        self.on_stop_filled  = None   # protective stop filled → position closed
+        self.on_entry_filled = None   # entry market order filled
+        self.on_exit_filled  = None   # closing market order filled
 
     def _get_contract(self, symbol: str):
         if symbol not in self._contracts:
@@ -183,6 +185,19 @@ class IBKRExecution:
 
     def _ref(self, trade_id: str) -> str:
         return f"{self.ORDER_REF_PREFIX}{trade_id}"
+
+    def _make_fill_reporter(self, trade_id: str, which: str):
+        """Report an entry/exit fill's avg price back to the orchestrator."""
+        def _on_filled(trade):
+            price = getattr(trade.orderStatus, "avgFillPrice", 0.0) or 0.0
+            cb = self.on_entry_filled if which == "entry" else self.on_exit_filled
+            if cb is not None:
+                try:
+                    cb(trade_id, price)
+                except Exception as e:
+                    log.error(f"[IBKR] on_{which}_filled callback failed for {trade_id}: {e}",
+                              exc_info=True)
+        return _on_filled
 
     def _make_stop_fill_handler(self, trade_id: str):
         def _on_filled(trade):
@@ -227,7 +242,8 @@ class IBKRExecution:
 
             self._trades[pos.trade_id]      = parent_trade
             self._stop_trades[pos.trade_id] = stop_trade
-            stop_trade.filledEvent += self._make_stop_fill_handler(pos.trade_id)
+            stop_trade.filledEvent   += self._make_stop_fill_handler(pos.trade_id)
+            parent_trade.filledEvent += self._make_fill_reporter(pos.trade_id, "entry")
             pos.stop_order_id = stop_trade.order.orderId
 
             log.info(
@@ -285,7 +301,8 @@ class IBKRExecution:
                         f"already filled — no closing order sent  ({reason})"
                     )
                     return
-                self._ib.placeOrder(contract, order)
+                exit_trade = self._ib.placeOrder(contract, order)
+                exit_trade.filledEvent += self._make_fill_reporter(pos.trade_id, "exit")
                 log.info(label)
             except Exception as e:
                 log.error(f"[IBKR] placeOrder exit failed for {pos.symbol}: {e}")

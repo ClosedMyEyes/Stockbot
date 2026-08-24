@@ -52,16 +52,23 @@ TRADE_FIELDS = [
     "obs_up_vol", "obs_down_vol", "vol_delta_ratio",
     "impulse_high", "impulse_low", "deep_retrace_ratio",
     "gap_atr_ratio", "first_bar_vol_ratio", "bars_to_entry",
+    # Broker fill reporting (IBKR mode; appended so existing column order and
+    # backtest-comparison scripts keep working). exit_fill_price is populated
+    # inline when the fill is known at close time (broker-stop exits);
+    # software exits fill a bar later — see fill_log.csv for those.
+    "entry_fill_price", "exit_fill_price", "slippage_r",
 ]
 
 
 def log_trade(pos: OpenPosition, exit_price: float, exit_time: str,
               exit_reason: str, result_r: float, bars_to_exit: int,
-              meta: dict = None):
+              meta: dict = None,
+              exit_fill_price: float = None, slippage_r: float = None):
     _ensure_dir()
     meta = meta or {}
     dir_mult = 1 if pos.direction == "long" else -1
     pnl = (exit_price - pos.entry_price) * dir_mult * pos.shares
+    entry_fill = getattr(pos, "entry_fill_price", None)
     row = {
         "strategy_id":   pos.strategy_id,
         "symbol":        pos.symbol,
@@ -79,10 +86,35 @@ def log_trade(pos: OpenPosition, exit_price: float, exit_time: str,
         "exit_reason":   exit_reason,
         "bars_to_exit":  bars_to_exit,
         "R_dollars":     round(pos.R_dollars, 2),
+        "entry_fill_price": round(entry_fill, 4) if entry_fill is not None else "",
+        "exit_fill_price":  round(exit_fill_price, 4) if exit_fill_price is not None else "",
+        "slippage_r":       round(slippage_r, 4) if slippage_r is not None else "",
         **{k: meta.get(k, "") for k in TRADE_FIELDS if k in meta},
     }
     _write_row(config.TRADE_LOG_CSV, row, TRADE_FIELDS)
     log.info(f"Trade logged: {pos.symbol} {result_r:+.3f}R")
+
+
+# ── Fill log ──────────────────────────────────────────────────────────────────
+# Ground truth of broker fills (IBKR mode). Software exits log their trade row
+# at trigger time; the market order's actual fill lands here a moment later —
+# join on trade_id when analysing real slippage.
+
+FILL_FIELDS = ["timestamp", "trade_id", "kind", "symbol", "avg_price"]
+
+FILL_LOG_CSV = getattr(config, "FILL_LOG_CSV", "logs/fill_log.csv")
+
+
+def log_fill(trade_id: str, kind: str, symbol: str, avg_price: float):
+    """kind: 'entry' | 'exit' | 'stop'"""
+    _ensure_dir()
+    _write_row(FILL_LOG_CSV, {
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "trade_id":  trade_id,
+        "kind":      kind,
+        "symbol":    symbol,
+        "avg_price": round(avg_price, 4) if avg_price else "",
+    }, FILL_FIELDS)
 
 
 # ── Signal log ────────────────────────────────────────────────────────────────

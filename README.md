@@ -79,11 +79,15 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
     │                             2-calls-per-60s rate limiter (prop-firm cap);
     │                             never blocks the bar callback
     │
-    └── Logger (logging_layer/)
-          trade_log.csv    signal_log.csv    daily_summary.csv
-          state.json    regime.json
-          (conflict_log.csv exists in the code but is never written —
-           log_conflict() has no call sites; conflicts appear in console log only)
+    ├── Logger (logging_layer/)
+    │     trade_log.csv    signal_log.csv    conflict_log.csv
+    │     fill_log.csv (broker fills, join on trade_id)
+    │     daily_summary.csv    state.json    regime.json
+    │
+    └── Dashboard (dashboard/)
+          http://localhost:8050 — LIVE / TRADES / HISTORY views, started as a
+          daemon thread when config.DASHBOARD_ENABLE is True; binds loopback
+          only; a dashboard crash never affects trading
 ```
 
 ---
@@ -172,7 +176,7 @@ Stockbot/
 │   └── __init__.py            ← CSV loggers
 │
 └── dashboard/
-    └── (currently broken — see Known limitations)
+    └── __init__.py            ← localhost:8050 monitor (LIVE/TRADES/HISTORY)
 ```
 
 ---
@@ -255,17 +259,16 @@ actual fill is looked up via `ib.fills()` and logged as a "disconnected exit"
 (entry price / 0R if no fill is found). A position IBKR shows that we don't
 know about is logged as an orphan and left alone.
 
-**Caveats (all on the fix list):**
+Restored daily R / P&L / halt status, open positions, and their meta now
+survive the session's first bar: `_on_new_session()` detects a restart into
+the same session (via the restored state's date) and keeps everything instead
+of resetting the day. Restored positions' strategies are re-marked in-trade
+when their symbol's first bar arrives.
 
-- Position `meta` is **not** actually persisted — `OpenPosition` has no `meta`
-  attribute, so state.json always stores `meta: {}`. Benign for exit detection
-  today (`gap_dir` equals the direction sign it falls back to), but don't rely
-  on restored meta.
-- Restored daily R / P&L / halt status does **not** survive the first bar of
-  the session: `_on_new_session()` unconditionally calls `risk.reset_day()`
-  and `state.clear_session()`, which also drops the restored positions from
-  state.json (they stay tracked in memory, but a second crash would orphan
-  them).
+**Remaining caveat (on the fix list):** position `meta` is not actually
+persisted — `OpenPosition` has no `meta` attribute, so state.json always
+stores `meta: {}`. Benign for exit detection today (`gap_dir` equals the
+direction sign it falls back to), but don't rely on restored meta.
 
 ---
 
@@ -275,10 +278,19 @@ know about is logged as an orphan and left alone.
 `entry_time`, `exit_time`, `entry_price`, `stop`, `tp`, `exit_price`,
 `result_R`, `exit_reason`, `direction`, plus strategy-specific meta fields.
 
-**Caveat:** live exit rows are currently logged at the exact stop/TP trigger
-price, but the actual market order fills at least one bar later. Logged
-`result_R` will therefore be optimistic vs true fills until exit prices are
-sourced from broker fill reports (on the fix list).
+**Fill reporting (IBKR mode):** `result_R` is deliberately still computed
+from **trigger prices** so it stays directly comparable to the backtest CSVs
+(and so the drawdown halts stay calibrated to backtest R). The actual broker
+fills are recorded alongside: `entry_fill_price` in the trade row (the entry
+fill arrives seconds after entry), `exit_fill_price` + `slippage_r` inline
+for broker-stop exits (fill known at close time), and every fill in
+`logs/fill_log.csv` (join on `trade_id`) for software exits whose market
+order fills after the row is written. Real-money slippage analysis:
+
+```python
+fills = pd.read_csv("logs/fill_log.csv")
+exit_fills = fills[fills["kind"] == "exit"].set_index("trade_id")["avg_price"]
+```
 
 ```python
 import pandas as pd
@@ -310,15 +322,16 @@ print(live_gfl["result_R"].describe())
 | ~~Broker-side stop orders~~ | **Fixed 2026-08-23** (`--ibkr` mode). Entries now transmit a parent market order + attached GTC stop; software exits cancel-before-close; broker stop fills route back through `on_stop_filled` (logged as "stopped (broker stop)" with the actual fill price); reconciliation re-associates or re-places stops and cancels orphaned ones. Covered by `tests/test_ibkr_stops.py` (mocked IBKR). **Remaining:** one live paper-TWS session to verify end-to-end (enter trade → kill bot → stop still resting in TWS → restart → stop re-associated); TP is still software-only (no OCA bracket); SignalStack mode remains software-protected only. |
 | ~~Group B feed emits partial bars~~ | **Fixed 2026-08-23.** Symbols 91+ (fed via `reqHistoricalData(keepUpToDate=True)`) now emit `bars[-2]` — the completed bar — on `hasNewBar`, instead of the newly started partial bar, with a same-date guard so a pre-market snapshot's last bar isn't re-fed. Covered by `tests/test_feed_ku.py`. Still worth eyeballing one live session against a TWS chart. |
 | ~~Stale SessionContext at session rollover~~ | **Fixed 2026-08-23.** Strategies are now reset lazily on their own symbol's first bar of the session (with that symbol's fresh context), not en masse at global rollover with stale contexts. Gap `prior_close` and orb_short's weekday filters now see the correct session. Covered by `tests/test_session_reset.py` (the main test fails against the old code). |
-| Restart wipes restored session state | `_on_new_session()` resets daily P&L/halts and clears state.json's position list right after startup reconciliation restored them (details in "State file" above). |
-| Exit fill prices in logs    | Logged at the trigger price, not the actual fill. Wire order-status / execution callbacks into `ll.log_trade`.             |
+| ~~Restart wipes restored session state~~ | **Fixed 2026-08-23.** `_on_new_session()` is restart-aware: same-session restarts keep restored daily P&L/halts/positions/meta, and restored positions' strategies are re-marked in-trade on their symbol's first bar. Covered by `tests/test_restart_session.py`. |
+| ~~Exit fill prices in logs~~ | **Fixed 2026-08-23.** Broker fills now recorded: `entry_fill_price` / `exit_fill_price` / `slippage_r` columns appended to trade_log.csv plus a full `fill_log.csv`; `result_R` intentionally stays trigger-based for backtest comparability (see "Comparing live vs backtest"). |
 | ~~Disconnected-exit fill lookup broken~~ | **Fixed 2026-08-23.** `_query_exit_fill` now uses `ib.fills()` (Fill objects carry `.contract`), and `_estimate_result_r` divides by per-share risk instead of `R_dollars`. Covered by `tests/test_state_ghost.py`. |
 | Position meta not persisted | `state_manager.on_position_open` reads `getattr(pos, "meta", {})` but `OpenPosition` has no such attribute — always `{}`. Pass `signal.meta` through instead. |
-| Dashboard                   | **Broken.** `dashboard/dashboard__init__.py` is misnamed (should be `__init__.py`) and nothing imports it — the localhost:8050 dashboard does not start. The module itself looks compatible with the current orchestrator (reads `risk.summary()` fields that all exist), so rename + wire-up should be enough. |
+| Hold-cap `hold_cap_exit_r` semantics | The bars-based cap is wired (`hold_cap_bars`); the companion `hold_cap_exit_r` param's backtest meaning was lost with the old PC's data — currently unused. Owner to clarify before enabling caps. |
+| ~~Dashboard~~               | **Fixed 2026-08-23.** Renamed to `dashboard/__init__.py`, started by `run()` behind `config.DASHBOARD_ENABLE` on a daemon thread (crash-isolated from trading), binds `127.0.0.1` only, and takes the position lock around `risk.summary()`. Covered by `tests/test_dashboard.py`. |
 | IBKR subscription limits    | 164 unique symbols: 90 via `reqRealTimeBars` + 74 via `keepUpToDate` historical. Default live market-data entitlement is 100 concurrent lines — verify your account's line count or expect "max tickers reached" errors on part of the universe. |
-| Regime download blocks bar thread | `load_for_session()` runs a synchronous yfinance download on the event-loop thread when the first bar of the session (09:30) arrives — bars queue behind it. Fine at ~1s, bad if yfinance throttles. Consider pre-fetching before the open. |
-| Hold-time cap               | `hold_cap_bars` / `hold_cap_exit_r` params exist in `config.STRATEGY_PARAMS` (currently 0 = disabled) but `_detect_exit()` in main.py does not read them yet. |
+| ~~Regime download blocks bar thread~~ | **Fixed 2026-08-23.** `run()` pre-fetches the regime payload pre-market; `_on_new_session` uses the cached payload when it's from today and downloads only as a fallback. |
+| ~~Hold-time cap~~           | **Fixed 2026-08-23.** `_detect_exit()` now honors `hold_cap_bars` (exit at bar close, reason "hold cap"; stop/TP take precedence within a bar). All params remain 0 = disabled, so behavior is unchanged until enabled. Same-symbol conflicts also now reach conflict_log.csv. Covered by `tests/test_hold_cap.py` / `tests/test_misc_p2.py`. |
 | ~~requirements.txt~~        | **Fixed 2026-08-23.** `yfinance` (and `pytest`) added.                                                                     |
 | ~~Repo hygiene~~            | **Fixed 2026-08-23.** `.gitignore` added; committed `__pycache__/*.pyc` untracked.                                         |
 | Pre-market gap calculator   | Gap is computed from prior close vs first RTH bar open. A true pre-market feed would give earlier visibility. (`PREMARKET_ROUTINE_TIME` in config is currently unused.) |
-| Tests                       | `tests/` now covers the Group B feed handler, per-symbol session resets, ghost-exit logging, `_do_close` ordering (exit order fires before strategy callbacks and survives an `on_exit` exception), broker-side stops (mocked IBKR), and a multi-thread stress test of the locking around position state. Run `python -m pytest Stockbot/tests` from the parent directory. Still uncovered: RiskManager approve/halt logic, reconcile, rate limiter, EOD timer scheduling. |
+| Tests                       | `tests/` (39 tests) covers the Group B feed handler, per-symbol session resets, ghost-exit logging, `_do_close` ordering, broker-side stops (mocked IBKR), the locking stress test, fill logging, restart preservation, hold cap, dashboard, and conflict/regime plumbing. Run `python -m pytest Stockbot/tests` from the parent directory. Still uncovered: RiskManager halt thresholds, reconcile edge cases, rate limiter, EOD timer scheduling. |

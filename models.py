@@ -52,6 +52,11 @@ class OpenPosition:
     # entry. Persisted to state.json so reconciliation after a restart can
     # re-associate (or re-place) the stop.
     stop_order_id: Optional[int] = None
+    # IBKR mode: actual average fill price of the entry order, reported by
+    # the broker seconds after entry. pos.entry_price (the modeled fill,
+    # slippage included) stays the basis for all R math — this is recorded
+    # alongside it in trade_log.csv for live-vs-backtest slippage analysis.
+    entry_fill_price: Optional[float] = None
 
 
 @dataclass
