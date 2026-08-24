@@ -91,17 +91,17 @@ def ex():
 
 # ── (a) entry ────────────────────────────────────────────────────────────────
 
-def test_entry_places_parent_market_plus_gtc_stop(ex):
+def test_entry_places_full_bracket(ex):
     executor, ib = ex
-    pos = _make_pos()  # short: entry SELL, protection BUY
+    pos = _make_pos()  # short: entry SELL, protection/TP BUY
 
     assert executor.send_entry(pos) is True
-    assert len(ib.placed) == 2
-    parent, stop = ib.placed
+    assert len(ib.placed) == 3
+    parent, stop, tp = ib.placed
 
     assert parent.order.orderType == "MKT"
     assert parent.order.action == "SELL"
-    assert parent.order.transmit is False          # transmitted with the child
+    assert parent.order.transmit is False          # transmitted with the last child
     assert parent.order.orderRef == "stockbot:t1"
 
     assert stop.order.orderType == "STP"
@@ -109,37 +109,47 @@ def test_entry_places_parent_market_plus_gtc_stop(ex):
     assert stop.order.auxPrice == 101.0            # rounded to cents
     assert stop.order.tif == "GTC"
     assert stop.order.parentId == parent.order.orderId
-    assert stop.order.transmit is True
+    assert stop.order.transmit is False
     assert pos.stop_order_id == stop.order.orderId
 
+    assert tp.order.orderType == "LMT"
+    assert tp.order.action == "BUY"
+    assert tp.order.lmtPrice == 97.0
+    assert tp.order.tif == "GTC"
+    assert tp.order.parentId == parent.order.orderId
+    assert tp.order.transmit is True               # last order fires the bracket
+    assert pos.tp_order_id == tp.order.orderId
 
-def test_entry_long_uses_sell_stop(ex):
+
+def test_entry_long_uses_sell_children(ex):
     executor, ib = ex
-    pos = _make_pos(direction="long", stop=98.996)
+    pos = _make_pos(direction="long", stop=98.996, tp=103.004)
     executor.send_entry(pos)
-    parent, stop = ib.placed
+    parent, stop, tp = ib.placed
     assert parent.order.action == "BUY"
     assert stop.order.action == "SELL"
     assert stop.order.auxPrice == 99.0
+    assert tp.order.action == "SELL"
+    assert tp.order.lmtPrice == 103.0
 
 
 # ── (b) software exit ────────────────────────────────────────────────────────
 
-def test_exit_cancels_stop_exactly_once_then_closes(ex):
+def test_exit_cancels_children_exactly_once_then_closes(ex):
     executor, ib = ex
     pos = _make_pos()
     executor.send_entry(pos)
-    stop_order = ib.placed[1].order
+    stop_order, tp_order = ib.placed[1].order, ib.placed[2].order
 
     executor.send_exit(pos, 99.0, "TP hit")
 
-    assert ib.cancelled == [stop_order]
+    assert ib.cancelled == [stop_order, tp_order]
     close = ib.placed[-1]
     assert close.order.orderType == "MKT"
     assert close.order.action == "BUY"             # closes the short
 
     executor.send_exit(pos, 99.0, "TP hit")        # e.g. redundant path
-    assert ib.cancelled == [stop_order]            # still exactly one cancel
+    assert ib.cancelled == [stop_order, tp_order]  # still exactly one cancel each
 
 
 def test_exit_skips_close_if_stop_already_filled(ex):
@@ -147,12 +157,13 @@ def test_exit_skips_close_if_stop_already_filled(ex):
     pos = _make_pos()
     executor.send_entry(pos)
     ib.placed[1].orderStatus.status = "Filled"     # stop beat us to it
+    tp_order = ib.placed[2].order
 
     n_before = len(ib.placed)
     executor.send_exit(pos, 99.0, "stopped")
 
     assert len(ib.placed) == n_before              # no duplicate close order
-    assert ib.cancelled == []                      # nothing to cancel
+    assert ib.cancelled == [tp_order]              # sibling TP cleaned up only
 
 
 # ── (c) EOD / force-close path ───────────────────────────────────────────────
@@ -175,38 +186,72 @@ def test_force_close_path_cancels_stop(orchestrator, ex):
 
 # ── (d) reconcile ────────────────────────────────────────────────────────────
 
-def test_reconcile_replaces_missing_stop(ex):
+def test_reconcile_replaces_missing_children(ex):
     executor, ib = ex
-    pos = _make_pos()                              # no stop at TWS, no id
+    pos = _make_pos()                              # nothing at TWS, no ids
 
     executor.reconcile_stops([pos])
 
-    st = ib.placed[-1]
+    assert len(ib.placed) == 2
+    st, tp = ib.placed
     assert st.order.orderType == "STP"
     assert st.order.tif == "GTC"
     assert st.order.action == "BUY"
     assert st.order.parentId == 0                  # position exists — no parent
     assert st.order.orderRef == "stockbot:t1"
+    assert st.order.ocaGroup == "stockbot:t1"      # parentless pair still OCAs
+    assert tp.order.orderType == "LMT"
+    assert tp.order.lmtPrice == 97.0
+    assert tp.order.ocaGroup == "stockbot:t1"
     assert pos.stop_order_id == st.order.orderId
+    assert pos.tp_order_id == tp.order.orderId
     assert executor._stop_trades["t1"] is st
+    assert executor._tp_trades["t1"] is tp
 
 
-def test_reconcile_reassociates_existing_stop(ex):
+def test_reconcile_reassociates_existing_children(ex):
     executor, ib = ex
-    resting = FakeTrade(
+    resting_stop = FakeTrade(
         SimpleNamespace(symbol="GS"),
         SimpleNamespace(orderId=555, orderType="STP",
                         orderRef="stockbot:t1", parentId=0),
     )
-    ib.open = [resting]
+    resting_tp = FakeTrade(
+        SimpleNamespace(symbol="GS"),
+        SimpleNamespace(orderId=556, orderType="LMT",
+                        orderRef="stockbot:t1", parentId=0),
+    )
+    ib.open = [resting_stop, resting_tp]
+    pos = _make_pos()
+    pos.stop_order_id = 555
+    pos.tp_order_id = 556
+
+    executor.reconcile_stops([pos])
+
+    assert ib.placed == []                              # nothing re-placed
+    assert executor._stop_trades["t1"] is resting_stop
+    assert executor._tp_trades["t1"] is resting_tp
+    assert len(resting_stop.filledEvent.handlers) == 1  # fill routing re-attached
+    assert len(resting_tp.filledEvent.handlers) == 1
+
+
+def test_reconcile_replaces_only_the_missing_child(ex):
+    """Stop survived the restart, TP didn't → only the TP is re-placed."""
+    executor, ib = ex
+    resting_stop = FakeTrade(
+        SimpleNamespace(symbol="GS"),
+        SimpleNamespace(orderId=555, orderType="STP",
+                        orderRef="stockbot:t1", parentId=0),
+    )
+    ib.open = [resting_stop]
     pos = _make_pos()
     pos.stop_order_id = 555
 
     executor.reconcile_stops([pos])
 
-    assert ib.placed == []                         # nothing re-placed
-    assert executor._stop_trades["t1"] is resting
-    assert len(resting.filledEvent.handlers) == 1  # fill routing re-attached
+    assert len(ib.placed) == 1
+    assert ib.placed[0].order.orderType == "LMT"
+    assert executor._stop_trades["t1"] is resting_stop
 
 
 def test_reconcile_cancels_orphaned_stop_of_departed_trade(ex):
@@ -225,15 +270,16 @@ def test_reconcile_cancels_orphaned_stop_of_departed_trade(ex):
 
 # ── (e) failed fill ──────────────────────────────────────────────────────────
 
-def test_failed_fill_cancels_entry_and_child_stop(ex):
+def test_failed_fill_cancels_entry_and_children(ex):
     executor, ib = ex
     pos = _make_pos()
     executor.send_entry(pos)
-    parent_order, stop_order = ib.placed[0].order, ib.placed[1].order
+    parent_order, stop_order, tp_order = (t.order for t in ib.placed)
 
     executor.cancel_order(pos)
 
     assert stop_order in ib.cancelled
+    assert tp_order in ib.cancelled
     assert parent_order in ib.cancelled
 
 
@@ -266,6 +312,7 @@ def test_broker_stop_fill_closes_position_without_duplicate_order(orchestrator, 
     strat._in_trade = True
 
     stop_trade = executor._stop_trades["t1"]
+    tp_order   = executor._tp_trades["t1"].order
     stop_trade.orderStatus.status = "Filled"
     stop_trade.orderStatus.avgFillPrice = 101.2
     n_before = len(ib.placed)
@@ -274,7 +321,7 @@ def test_broker_stop_fill_closes_position_without_duplicate_order(orchestrator, 
 
     assert "t1" not in orch.risk.open_positions    # exit recorded
     assert len(ib.placed) == n_before              # no duplicate close order
-    assert ib.cancelled == []                      # stop is gone, not cancelled
+    assert ib.cancelled == [tp_order]              # sibling TP defensively cancelled
     assert strat._in_trade is False
 
     # a late software exit for the same trade is a clean no-op

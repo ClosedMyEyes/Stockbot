@@ -48,10 +48,11 @@ class OpenPosition:
     entry_time:    str
     session_date:  str
     entry_bar_i:   int = 0
-    # IBKR mode: orderId of the broker-side GTC protective stop attached on
-    # entry. Persisted to state.json so reconciliation after a restart can
-    # re-associate (or re-place) the stop.
+    # IBKR mode: orderIds of the broker-side GTC protective stop and GTC
+    # take-profit limit attached on entry. Persisted to state.json so
+    # reconciliation after a restart can re-associate (or re-place) them.
     stop_order_id: Optional[int] = None
+    tp_order_id:   Optional[int] = None
     # IBKR mode: actual average fill price of the entry order, reported by
     # the broker seconds after entry. pos.entry_price (the modeled fill,
     # slippage included) stays the basis for all R math — this is recorded

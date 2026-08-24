@@ -67,13 +67,15 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
     │
     ├── Executor  (execution/__init__.py — three modes)
     │     • PaperExecution        logs only, instant simulated fills
-    │     • IBKRExecution         parent MarketOrder + attached GTC StopOrder
-    │                             (broker-side protection, transmitted together);
-    │                             software exits cancel the resting stop before
-    │                             closing; broker stop fills are routed back via
-    │                             on_stop_filled so no duplicate close is sent;
-    │                             reconcile_stops() re-places/re-associates stops
-    │                             after restarts; thread-safe via
+    │     • IBKRExecution         full bracket: parent MarketOrder + GTC
+    │                             StopOrder + GTC take-profit LimitOrder
+    │                             (transmitted together, children OCA);
+    │                             software exits cancel resting children
+    │                             before closing; broker stop/TP fills routed
+    │                             back via on_stop_filled / on_tp_filled so no
+    │                             duplicate close is sent; reconcile_stops()
+    │                             re-places/re-associates children after
+    │                             restarts; thread-safe via
     │                             call_soon_threadsafe off the event loop
     │     • SignalStackExecution  queued webhook worker thread with a shared
     │                             2-calls-per-60s rate limiter (prop-firm cap);
@@ -100,16 +102,19 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
 | `--ibkr` (default) | IBKRExecution      | Direct `placeOrder` market orders to whichever TWS/Gateway you're connected to (paper account on 7497, live on 7496). |
 | `--live`         | SignalStackExecution | HTTP webhook → SignalStack → broker. Prompts for confirmation. Rate-limited to 2 actions/60s. |
 
-> ⚠️ **Exit management:** in `--ibkr` mode every entry is a parent market
-> order plus an attached **GTC protective stop resting at the broker**, so a
-> dead process no longer leaves positions unprotected. Software exit detection
-> stays as a redundant layer: it cancels the resting stop before sending a
-> closing order, and a broker-side stop fill is routed back so no duplicate
-> close is ever sent. Targets (TP) are still software-monitored only.
-> `--live` (SignalStack) is market-only — those positions remain
-> **software-protected only** (a startup WARNING says so). The `--ibkr` stop
-> flow is unit-tested against a mocked IBKR but still needs one live
-> verification session against paper TWS (see Known limitations).
+> ⚠️ **Exit management:** in `--ibkr` mode every entry is a **full bracket**
+> resting at the broker — parent market order + GTC protective stop + GTC
+> take-profit limit (children cancel each other). A dead process leaves
+> positions fully protected, and TPs fill at the touch at price-or-better
+> instead of via a market order a bar after the touch. Software exit
+> detection stays as a redundant layer: it cancels the resting children
+> before sending a closing order, and broker-side fills are routed back so
+> no duplicate close is ever sent. All broker-side closes are **accounted at
+> the trigger level** (result_R stays backtest-comparable); actual fills go
+> to the slippage columns. `--live` (SignalStack) is market-only — those
+> positions remain **software-protected only** (a startup WARNING says so).
+> The bracket flow is unit-tested against a mocked IBKR but still needs one
+> live verification session against paper TWS (see Known limitations).
 
 ---
 
@@ -281,16 +286,13 @@ direction sign it falls back to), but don't rely on restored meta.
 **Fill reporting (IBKR mode):** `result_R` is deliberately still computed
 from **trigger prices** so it stays directly comparable to the backtest CSVs
 (and so the drawdown halts stay calibrated to backtest R). The actual broker
-fills are recorded alongside: `entry_fill_price` in the trade row (the entry
-fill arrives seconds after entry), `exit_fill_price` + `slippage_r` inline
-for broker-stop exits (fill known at close time), and every fill in
-`logs/fill_log.csv` (join on `trade_id`) for software exits whose market
-order fills after the row is written. Real-money slippage analysis:
-
-```python
-fills = pd.read_csv("logs/fill_log.csv")
-exit_fills = fills[fills["kind"] == "exit"].set_index("trade_id")["avg_price"]
-```
+fills are recorded alongside, never in place of the trigger numbers:
+`entry_fill_price` lands in the trade row directly (the entry fill arrives
+seconds after entry); `exit_fill_price` + `slippage_r` are inline for broker
+stop/TP exits (fill known at close time) and **back-filled at post-market**
+for software exits (`finalize_fills()` merges `logs/fill_log.csv` into the
+trade rows on `trade_id`). After any completed session, every row carries
+both the backtest-comparable numbers and the real fills.
 
 ```python
 import pandas as pd
@@ -319,14 +321,14 @@ print(live_gfl["result_R"].describe())
 
 | Item                        | Status                                                                                                                    |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| ~~Broker-side stop orders~~ | **Fixed 2026-08-23** (`--ibkr` mode). Entries now transmit a parent market order + attached GTC stop; software exits cancel-before-close; broker stop fills route back through `on_stop_filled` (logged as "stopped (broker stop)" with the actual fill price); reconciliation re-associates or re-places stops and cancels orphaned ones. Covered by `tests/test_ibkr_stops.py` (mocked IBKR). **Remaining:** one live paper-TWS session to verify end-to-end (enter trade → kill bot → stop still resting in TWS → restart → stop re-associated); TP is still software-only (no OCA bracket); SignalStack mode remains software-protected only. |
+| ~~Broker-side stop orders~~ | **Fixed 2026-08-23** (`--ibkr` mode), extended same day to **full brackets**: parent market order + GTC stop + GTC take-profit limit, children cancelling each other. Software exits cancel-before-close; broker fills route back (reasons "stopped (broker stop)" / "TP hit (broker limit)", accounted at trigger, fill in slippage columns); reconciliation re-associates or re-places both children (re-placed pairs get an explicit ocaGroup) and cancels orphaned ones. Covered by `tests/test_ibkr_stops.py` + `tests/test_fill_logging.py` (mocked IBKR). **Remaining:** one live paper-TWS session to verify end-to-end (enter trade → kill bot → stop+TP still resting in TWS → restart → children re-associated); SignalStack mode remains software-protected only. |
 | ~~Group B feed emits partial bars~~ | **Fixed 2026-08-23.** Symbols 91+ (fed via `reqHistoricalData(keepUpToDate=True)`) now emit `bars[-2]` — the completed bar — on `hasNewBar`, instead of the newly started partial bar, with a same-date guard so a pre-market snapshot's last bar isn't re-fed. Covered by `tests/test_feed_ku.py`. Still worth eyeballing one live session against a TWS chart. |
 | ~~Stale SessionContext at session rollover~~ | **Fixed 2026-08-23.** Strategies are now reset lazily on their own symbol's first bar of the session (with that symbol's fresh context), not en masse at global rollover with stale contexts. Gap `prior_close` and orb_short's weekday filters now see the correct session. Covered by `tests/test_session_reset.py` (the main test fails against the old code). |
 | ~~Restart wipes restored session state~~ | **Fixed 2026-08-23.** `_on_new_session()` is restart-aware: same-session restarts keep restored daily P&L/halts/positions/meta, and restored positions' strategies are re-marked in-trade on their symbol's first bar. Covered by `tests/test_restart_session.py`. |
 | ~~Exit fill prices in logs~~ | **Fixed 2026-08-23.** Broker fills now recorded: `entry_fill_price` / `exit_fill_price` / `slippage_r` columns appended to trade_log.csv plus a full `fill_log.csv`; `result_R` intentionally stays trigger-based for backtest comparability (see "Comparing live vs backtest"). |
 | ~~Disconnected-exit fill lookup broken~~ | **Fixed 2026-08-23.** `_query_exit_fill` now uses `ib.fills()` (Fill objects carry `.contract`), and `_estimate_result_r` divides by per-share risk instead of `R_dollars`. Covered by `tests/test_state_ghost.py`. |
 | Position meta not persisted | `state_manager.on_position_open` reads `getattr(pos, "meta", {})` but `OpenPosition` has no such attribute — always `{}`. Pass `signal.meta` through instead. |
-| Hold-cap `hold_cap_exit_r` semantics | The bars-based cap is wired (`hold_cap_bars`); the companion `hold_cap_exit_r` param's backtest meaning was lost with the old PC's data — currently unused. Owner to clarify before enabling caps. |
+| ~~Hold-cap `hold_cap_exit_r` semantics~~ | **Resolved 2026-08-23** — owner confirmed: at the cap, cut the trade only if unrealized R ≤ `hold_cap_exit_r`; winners keep running. Wired into `_detect_exit()` (absent threshold = unconditional cap). All caps remain 0 = disabled. |
 | ~~Dashboard~~               | **Fixed 2026-08-23.** Renamed to `dashboard/__init__.py`, started by `run()` behind `config.DASHBOARD_ENABLE` on a daemon thread (crash-isolated from trading), binds `127.0.0.1` only, and takes the position lock around `risk.summary()`. Covered by `tests/test_dashboard.py`. |
 | IBKR subscription limits    | 164 unique symbols: 90 via `reqRealTimeBars` + 74 via `keepUpToDate` historical. Default live market-data entitlement is 100 concurrent lines — verify your account's line count or expect "max tickers reached" errors on part of the universe. |
 | ~~Regime download blocks bar thread~~ | **Fixed 2026-08-23.** `run()` pre-fetches the regime payload pre-market; `_on_new_session` uses the cached payload when it's from today and downloads only as a fallback. |

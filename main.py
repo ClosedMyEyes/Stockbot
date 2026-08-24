@@ -474,12 +474,25 @@ class Orchestrator:
 
         # Hold-time cap (config STRATEGY_PARAMS, 0 = disabled). Checked after
         # stop/TP so price-based exits take precedence within a bar.
-        hold_cap = config.STRATEGY_PARAMS.get(pos.strategy_id, {}).get("hold_cap_bars", 0)
+        # Semantics (confirmed by owner): once bars_held reaches the cap, cut
+        # the trade only if it's doing WORSE than hold_cap_exit_r (unrealized
+        # R at bar close <= threshold); winners past the cap keep running.
+        # If hold_cap_exit_r is absent, the cap exits unconditionally.
+        params   = config.STRATEGY_PARAMS.get(pos.strategy_id, {})
+        hold_cap = params.get("hold_cap_bars", 0)
         if hold_cap and hold_cap > 0:
             bars_held = (self._bar_counters.get(pos.symbol, 0)
                          - self._position_entry_bar.get(pos.trade_id, 0))
             if bars_held >= hold_cap:
-                return bar.close, "hold cap"
+                exit_r_thresh = params.get("hold_cap_exit_r", None)
+                if exit_r_thresh is None:
+                    return bar.close, "hold cap"
+                risk_ps = abs(pos.entry_price - pos.stop)
+                if risk_ps > 0:
+                    dir_mult = 1 if pos.direction == "long" else -1
+                    unrealized_r = (bar.close - pos.entry_price) * dir_mult / risk_ps
+                    if unrealized_r <= exit_r_thresh:
+                        return bar.close, "hold cap"
 
         return None, None
 
@@ -556,30 +569,48 @@ class Orchestrator:
         """No-bar close path — used by EOD safety timer and reconnect recovery."""
         self._do_close(trade_id, pos, exit_price, reason, exit_time_str="16:00")
 
-    def _on_broker_stop_filled(self, trade_id: str, avg_price: float):
+    @staticmethod
+    def _now_et_str() -> str:
+        try:
+            import zoneinfo
+            return datetime.datetime.now(
+                zoneinfo.ZoneInfo("America/New_York")).strftime("%H:%M")
+        except Exception:
+            return datetime.datetime.now().strftime("%H:%M")
+
+    def _on_broker_child_filled(self, trade_id: str, avg_price: float,
+                                kind: str):
         """
-        Called by IBKRExecution (on the ib event-loop thread) when a
-        broker-side protective stop fills. Records the exit through the normal
-        close path — the executor knows this trade_id already exited and will
-        not send a duplicate closing order.
+        Shared handler for broker-side bracket fills (stop or TP), called by
+        IBKRExecution on the ib event-loop thread. Records the exit through
+        the normal close path — the executor knows this trade_id already
+        exited and will not send a duplicate closing order.
+
+        Accounting is at the TRIGGER level (pos.stop / pos.tp), keeping
+        result_R comparable to the backtests; the actual fill goes into
+        exit_fill_price / slippage_r.
         """
         pos = self.risk.open_positions.get(trade_id)
         if pos is None:
             return  # software path already closed it — nothing to record
-        exit_price = avg_price if avg_price else pos.stop
-        try:
-            import zoneinfo
-            now_et = datetime.datetime.now(
-                zoneinfo.ZoneInfo("America/New_York")).strftime("%H:%M")
-        except Exception:
-            now_et = datetime.datetime.now().strftime("%H:%M")
+        if kind == "stop":
+            trigger, reason = pos.stop, "stopped (broker stop)"
+        else:
+            trigger, reason = pos.tp, "TP hit (broker limit)"
+        fill = avg_price if avg_price else trigger
         log.warning(
-            f"BROKER STOP filled: {pos.strategy_id}({pos.symbol}) "
-            f"trade_id={trade_id}  fill={exit_price:.4f}"
+            f"BROKER {kind.upper()} filled: {pos.strategy_id}({pos.symbol}) "
+            f"trade_id={trade_id}  trigger={trigger:.4f}  fill={fill:.4f}"
         )
-        ll.log_fill(trade_id, "stop", pos.symbol, avg_price)
-        self._do_close(trade_id, pos, exit_price, "stopped (broker stop)", now_et,
-                       exit_fill_price=exit_price, exit_trigger_price=pos.stop)
+        ll.log_fill(trade_id, kind, pos.symbol, avg_price)
+        self._do_close(trade_id, pos, trigger, reason, self._now_et_str(),
+                       exit_fill_price=fill, exit_trigger_price=trigger)
+
+    def _on_broker_stop_filled(self, trade_id: str, avg_price: float):
+        self._on_broker_child_filled(trade_id, avg_price, "stop")
+
+    def _on_broker_tp_filled(self, trade_id: str, avg_price: float):
+        self._on_broker_child_filled(trade_id, avg_price, "tp")
 
     def _on_entry_filled(self, trade_id: str, avg_price: float):
         """Broker reported the entry order's average fill (ib event thread)."""
@@ -832,6 +863,10 @@ class Orchestrator:
             f"$={risk_sum['daily_pnl_dollars']:+.2f}"
         )
 
+        # Back-fill actual exit fills (from fill_log.csv) into today's trade
+        # rows now that all closing orders have reported.
+        ll.finalize_fills()
+
     # =========================================================================
     # RECONNECT LOOP [R2]
     # =========================================================================
@@ -988,6 +1023,7 @@ class Orchestrator:
         if self.mode == "ibkr":
             self.executor = get_executor("ibkr", ib=feed._ib)
             self.executor.on_stop_filled  = self._on_broker_stop_filled
+            self.executor.on_tp_filled    = self._on_broker_tp_filled
             self.executor.on_entry_filled = self._on_entry_filled
             self.executor.on_exit_filled  = self._on_exit_filled
 

@@ -323,11 +323,28 @@ DONE (in working tree, not yet committed):
   - P2-6  conflict log now written from RiskManager.approve; regime payload
           pre-fetched in run() and reused at session open.
 
+  - 2026-08-23 (later, after owner sign-off on three open questions):
+    * TP upgraded to broker-side: entries are now FULL BRACKETS (parent MKT
+      + GTC stop + GTC take-profit limit, transmitted together, children
+      OCA; defensive sibling-cancel in the fill handlers; reconcile
+      re-associates/re-places BOTH children — re-placed pairs get explicit
+      ocaGroup — and cancels orphans of both types; tp_order_id persisted).
+      Owner confirmed limits are preferred: old flow paid market a bar after
+      the touch and missed intrabar wicks entirely.
+    * Broker-side closes now ACCOUNT AT TRIGGER (pos.stop / pos.tp) per the
+      owner's ruling that result_R stays trigger-based; actual fills go to
+      exit_fill_price / slippage_r.
+    * finalize_fills() at post-market back-fills exit fills from
+      fill_log.csv into trade_log.csv (trade_id column appended to join on),
+      so after any session every row carries trigger numbers AND real fills.
+    * hold_cap_exit_r wired with owner-confirmed semantics: at the cap, cut
+      only if unrealized R <= threshold; winners keep running; absent
+      threshold = unconditional. All caps still 0 = disabled.
+
 STILL OPEN: P2-3 (encapsulation), P2-4 (timezone robustness), P2-5 (meta
 persistence), P2-6 remainder (market-data lines entitlement check, warm-up/
 live dedup overlap — both operational/minor). Plus: live paper-TWS
-verification of P0-1 once TWS is installed, and the hold_cap_exit_r
-semantics question for the owner.
+verification of the bracket flow once TWS is installed.
 
 NOTE: this repo copy of HANDOFF.md is now the living document; the copy in
 C:\Users\mark\Downloads is stale and can be deleted.

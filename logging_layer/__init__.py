@@ -54,9 +54,10 @@ TRADE_FIELDS = [
     "gap_atr_ratio", "first_bar_vol_ratio", "bars_to_entry",
     # Broker fill reporting (IBKR mode; appended so existing column order and
     # backtest-comparison scripts keep working). exit_fill_price is populated
-    # inline when the fill is known at close time (broker-stop exits);
-    # software exits fill a bar later — see fill_log.csv for those.
-    "entry_fill_price", "exit_fill_price", "slippage_r",
+    # inline when the fill is known at close time (broker stop/TP exits);
+    # software exits fill moments later — finalize_fills() back-fills them
+    # from fill_log.csv at post-market, matching on trade_id.
+    "entry_fill_price", "exit_fill_price", "slippage_r", "trade_id",
 ]
 
 
@@ -89,6 +90,7 @@ def log_trade(pos: OpenPosition, exit_price: float, exit_time: str,
         "entry_fill_price": round(entry_fill, 4) if entry_fill is not None else "",
         "exit_fill_price":  round(exit_fill_price, 4) if exit_fill_price is not None else "",
         "slippage_r":       round(slippage_r, 4) if slippage_r is not None else "",
+        "trade_id":         pos.trade_id,
         **{k: meta.get(k, "") for k in TRADE_FIELDS if k in meta},
     }
     _write_row(config.TRADE_LOG_CSV, row, TRADE_FIELDS)
@@ -106,7 +108,7 @@ FILL_LOG_CSV = getattr(config, "FILL_LOG_CSV", "logs/fill_log.csv")
 
 
 def log_fill(trade_id: str, kind: str, symbol: str, avg_price: float):
-    """kind: 'entry' | 'exit' | 'stop'"""
+    """kind: 'entry' | 'exit' | 'stop' | 'tp'"""
     _ensure_dir()
     _write_row(FILL_LOG_CSV, {
         "timestamp": datetime.now().strftime("%H:%M:%S"),
@@ -115,6 +117,69 @@ def log_fill(trade_id: str, kind: str, symbol: str, avg_price: float):
         "symbol":    symbol,
         "avg_price": round(avg_price, 4) if avg_price else "",
     }, FILL_FIELDS)
+
+
+def finalize_fills() -> int:
+    """
+    Post-market: back-fill exit_fill_price / slippage_r into trade_log.csv
+    from fill_log.csv for rows whose exit fill wasn't known at write time
+    (software exits — the market order fills moments after the row lands).
+    result_R and every pre-existing column are untouched: fills are recorded
+    NEXT TO the trigger-based numbers, never in place of them.
+
+    Returns the number of rows patched. Failure-tolerant: any error leaves
+    both files as they were.
+    """
+    try:
+        with _write_lock:
+            if not (os.path.exists(config.TRADE_LOG_CSV)
+                    and os.path.exists(FILL_LOG_CSV)):
+                return 0
+
+            with open(FILL_LOG_CSV, newline="") as f:
+                exit_fills = {
+                    r["trade_id"]: r["avg_price"]
+                    for r in csv.DictReader(f)
+                    if r.get("kind") in ("exit", "stop", "tp") and r.get("avg_price")
+                }
+
+            with open(config.TRADE_LOG_CSV, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+            patched = 0
+            for row in rows:
+                tid = row.get("trade_id", "")
+                if not tid or row.get("exit_fill_price") or tid not in exit_fills:
+                    continue
+                try:
+                    fill    = float(exit_fills[tid])
+                    entry   = float(row["entry_price"])
+                    stop    = float(row["stop"])
+                    trigger = float(row["exit_price"])
+                    dir_mult = 1 if row["direction"] == "long" else -1
+                    risk_ps  = abs(entry - stop)
+                    row["exit_fill_price"] = round(fill, 4)
+                    if risk_ps > 0:
+                        row["slippage_r"] = round(
+                            (fill - trigger) * dir_mult / risk_ps, 4)
+                    patched += 1
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+            if patched:
+                tmp = config.TRADE_LOG_CSV + ".tmp"
+                with open(tmp, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=TRADE_FIELDS,
+                                            extrasaction="ignore")
+                    writer.writeheader()
+                    for row in rows:
+                        writer.writerow({k: row.get(k) or "" for k in TRADE_FIELDS})
+                os.replace(tmp, config.TRADE_LOG_CSV)
+                log.info(f"finalize_fills: back-filled {patched} trade row(s)")
+            return patched
+    except Exception as e:
+        log.error(f"finalize_fills failed (trade_log untouched): {e}")
+        return 0
 
 
 # ── Signal log ────────────────────────────────────────────────────────────────
