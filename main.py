@@ -13,8 +13,9 @@ Robustness additions vs v3:
   [R4] Bar dedup          — (symbol, date, time) set drops duplicate bars that
        ib_insync occasionally re-emits.
   [R5] EOD safety timer   — threading.Timer fires at config.EOD_SAFETY_AT
-       (15:01 local/CT = 16:01 ET) regardless of whether the 15:59 bar
-       arrived. Guarantees all positions are closed.
+       (14:59:30 CT = 15:59:30 ET, still inside the session so market orders
+       fill same-day) regardless of whether the EOD trigger bar arrived.
+       Guarantees all positions are closed.
   [R6] State timeouts     — strategies stuck in a non-idle state for >90 bars
        since last transition are auto-reset (orphaned pending_entry etc.).
 """
@@ -154,6 +155,10 @@ class Orchestrator:
         self._strat_prev_state:     Dict[tuple, object] = {}
         self._STATE_TIMEOUT_BARS = 90
 
+        # Symbols whose EOD close already ran this session (the >= trigger
+        # would otherwise re-run bookkeeping if a 15:59 bar arrives after
+        # the 15:58-triggered close)
+        self._eod_done: Set[str] = set()
         # Last known bar close per symbol — used by EOD safety timer for realistic exit price
         self._last_close: Dict[str, float] = {}
         # Accumulated intraday volume per symbol — flushed at EOD to feed session total vol
@@ -212,8 +217,15 @@ class Orchestrator:
 
         self._check_exits(bar, ctx)
 
-        if bar.time == config.EOD_BAR:
-            self._eod_close(bar, ctx)
+        # Live EOD: the 15:59 bar never streams (no successor bar exists to
+        # flush it), so the LAST real bar (15:58, completing ~15:59:00 ET)
+        # triggers the close — while market orders still fill same-day.
+        # _eod_done guards the once-per-symbol bookkeeping in case a later
+        # bar (e.g. 15:59 in simulation/paper replay) does arrive.
+        if bar.time >= config.EOD_TRIGGER_BAR:
+            if bar.symbol not in self._eod_done:
+                self._eod_done.add(bar.symbol)
+                self._eod_close(bar, ctx)
             self._session_open = False
             return
 
@@ -683,9 +695,10 @@ class Orchestrator:
 
     def _schedule_eod_timer(self, session_date: str):
         """
-        [R5] Schedule a safety timer for config.EOD_SAFETY_AT (local clock)
-        that closes any positions still open even if the 15:59 bar never
-        arrives for some symbols.
+        [R5] Schedule a safety backstop for config.EOD_SAFETY_AT (Central
+        Time, 30s before the close) that force-closes any positions still
+        open even if the EOD trigger bar never arrives for some symbols —
+        while market orders can still fill same-day.
         """
         if self._eod_timer is not None:
             self._eod_timer.cancel()
@@ -747,6 +760,13 @@ class Orchestrator:
                     self._shutting_down = True
                     if self._session_date and not self._post_market_done:
                         self._post_market(self._session_date)
+                    # Post-market ran at 15:59:30 ET — exit orders fired in the
+                    # final seconds may have reported their fills after it.
+                    # One idempotent sweep catches the stragglers.
+                    try:
+                        ll.finalize_fills()
+                    except Exception:
+                        pass
                     if self._feed:
                         self._feed.stop()
                     import os as _os
@@ -819,6 +839,7 @@ class Orchestrator:
         # bars); drop everything from previous sessions.
         self._seen_bars        = {k for k in self._seen_bars if k[1] == session_date}
         self._session_vol      = defaultdict(float)
+        self._eod_done         = set()
         self._strat_transition_bar.clear()
         self._strat_prev_state.clear()
 

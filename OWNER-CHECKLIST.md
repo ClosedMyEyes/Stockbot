@@ -1,9 +1,10 @@
 # OWNER CHECKLIST — what the bot needs from you
 
 Status as of 2026-08-23: every item on the HANDOFF fix list is implemented and
-covered by the test suite (50 tests — run them any time with the command at
-the bottom). What remains needs **you**: a TWS install, one account check, and
-one decision. Nothing here is optional before trading real money.
+covered by the test suite (53 tests — run them any time with the command at
+the bottom), and the EOD-timing decision (§3) is resolved and implemented.
+What remains needs **you**: a TWS install and one account check. Nothing here
+is optional before trading real money.
 
 ---
 
@@ -39,6 +40,9 @@ against a mocked IBKR, but it has never touched a real TWS.
    action at the broker, one row in `logs/trade_log.csv`, fills in
    `logs/fill_log.csv`, and after the session the trade row's
    `exit_fill_price` / `slippage_r` columns are populated.
+   For an EOD exit specifically: the closing order must appear in TWS at
+   ~15:59:00 ET (or 15:59:30 for the backstop) and FILL before 16:00 — if
+   you ever see an EOD order sitting unfilled after the close, tell me.
 8. Bonus check: pick one symbol from the second feed group (alphabetically
    after the first 90 — e.g. TGT or WFC) and compare a few of its logged
    bars against the TWS chart, verifying the partial-bar fix live.
@@ -58,31 +62,16 @@ Market Data Subscriptions (or ask IBKR support what your line count is).
   requested, and IBKR error 101 ("max tickers reached") means symbols are
   silently not streaming.
 
-## 3. DECISION NEEDED: end-of-day close timing
+## 3. ~~DECISION NEEDED: end-of-day close timing~~ — RESOLVED 2026-08-23
 
-Found in the 2026-08-23 deep pass — this one is genuinely broken as designed
-and needs your call because it changes *when* EOD exits happen:
-
-**The problem:** no symbol reliably delivers its 15:59 bar (both feed paths
-only emit a completed bar when the *next* bar starts, and RTH data ends at
-16:00 — there is no next bar). So EOD closes always fall to the safety timer
-at **16:01 ET** — but IBKR treats a market order submitted after the close as
-a **next-day order**. Positions would hold overnight and close at tomorrow's
-open. The GTC stops still protect you overnight, but it's unintended exposure
-and the logs would claim a 16:00 close that actually happened the next morning.
-
-**My recommendation:** close EOD positions when the day's last real bar
-completes (~15:59:00 ET, on the 15:58 bar's close) and move the backstop
-timer to 15:59:30 ET (14:59:30 CT). That's ~1 minute earlier than the
-backtests' 16:00 close — a small, honest divergence in exchange for
-guaranteed same-day fills.
-
-Alternatives if you prefer: (a) exit at 15:55 ET for more margin, or
-(b) submit real Market-on-Close orders before IBKR's 15:50 ET MOC cutoff —
-closest to the backtest's closing price, but more moving parts.
-
-**Tell me which and I'll implement it the same day.** Until then, avoid
-holding into the close on live money.
+You approved the recommendation and it's implemented + tested: each symbol's
+EOD close fires when its **last real bar completes (~15:59:00 ET)**, with the
+safety backstop at **15:59:30 ET** — both inside the session, so EOD market
+orders always fill same-day. (Background, for the record: the 15:59 bar never
+streams live, and IBKR treats post-close market orders as next-day orders —
+the old 16:01 ET timer would have produced silent overnight holds.) EOD exits
+now happen ~1 minute earlier than the backtests' 16:00 close; when comparing
+live vs backtest EOD rows, expect that small systematic difference.
 
 ## 4. Only if you return to SignalStack / prop-firm mode
 

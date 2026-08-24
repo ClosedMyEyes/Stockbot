@@ -58,12 +58,22 @@ STRATEGY_PRIORITY: List[str] = [
 # =============================================================================
 RTH_START = "09:30"
 RTH_END   = "15:59"
-EOD_BAR   = "15:59"
+EOD_BAR   = "15:59"     # last bar of a session in HISTORICAL data (warm-up uses this)
+EOD_TRIGGER_BAR = "15:58"  # LIVE EOD trigger: completion of this bar (~15:59:00 ET
+                           # wall clock) force-closes that symbol's positions. The
+                           # 15:59 bar never streams live — a completed bar is only
+                           # emitted when its successor starts, and RTH data ends at
+                           # 16:00 — and IBKR treats post-close market orders as
+                           # NEXT-DAY orders. Closing on the last real bar keeps EOD
+                           # exits inside the session; diverges from the backtest
+                           # convention (exit at the 15:59 close) by ~1 minute.
+                           # Owner-approved 2026-08-23.
 PREMARKET_ROUTINE_TIME = "09:15"   # when to run ATR/gap pre-calc
-EOD_SAFETY_AT          = "15:01"   # EOD safety timer — LOCAL system clock (CT)
-                                   # 15:01 CT = 16:01 ET (1 min after market close)
-                                   # MUST fire before PROCESS_EXIT_AT
-PROCESS_EXIT_AT        = "15:45"   # auto-exit the Python process — uses LOCAL system clock (CT)
+EOD_SAFETY_AT          = "14:59:30"  # EOD safety backstop — Central Time wall clock.
+                                     # 14:59:30 CT = 15:59:30 ET, 30s BEFORE the close:
+                                     # the backstop must fire while market orders can
+                                     # still fill same-day. MUST be before PROCESS_EXIT_AT.
+PROCESS_EXIT_AT        = "15:45"   # auto-exit the Python process — Central Time wall clock
                                    # 15:45 CT = 16:45 ET (IBC closes TWS at 15:30 CT / 16:30 ET)
 
 # =============================================================================

@@ -1,8 +1,8 @@
 # Trading Bot Orchestrator
 
 > 📋 **Owner checklist:** see [OWNER-CHECKLIST.md](OWNER-CHECKLIST.md) for the
-> things the bot still needs from **you** — the live TWS verification, the
-> market-data-line check, and one EOD-timing decision.
+> things the bot still needs from **you** — the live TWS verification and the
+> market-data-line check.
 
 Central hub for 6 intraday trading strategy modules. Feeds live 1-min bars from
 IBKR into each strategy, routes signals through per-strategy and portfolio-level
@@ -132,7 +132,7 @@ IBKRFeed.on_bar(bar)         ← bar dedup (symbol+date+time) drops IBKR re-emit
 | Orphan position (not in our state) | Logged as WARNING. Never touched automatically — requires manual review.                                                  |
 | Partial fill                       | Fill verification 2 bars after entry via the ib_insync position cache (thread-safe, non-blocking). If actual < 80% of expected, `pos.shares` is adjusted so R math stays correct. If 0 shares, position state is cleared and the strategy re-arms. |
 | Duplicate bar (ib_insync re-emit)  | Deduplicated by `(symbol, date, time)` key — silently dropped.                                                            |
-| 15:59 bar never arrives            | EOD safety timer fires at `EOD_SAFETY_AT` (15:01 CT / 16:01 ET) on the local clock and force-closes all remaining positions at the last known bar close, through the full close path (executor + CSV + state.json). |
+| 15:59 bar never arrives (it never does, live) | A completed bar is only emitted when its successor starts, and RTH data ends at 16:00 — so the **last real bar (15:58, completing ~15:59:00 ET)** triggers each symbol's EOD close, and the safety backstop fires at `EOD_SAFETY_AT` (14:59:30 CT / 15:59:30 ET) for anything left — both inside the session, when market orders still fill same-day. (IBKR treats post-close market orders as next-day orders, so closing at 16:01 ET would have meant silent overnight holds.) EOD exits are ~1 min earlier than the backtests' 16:00 close — owner-approved trade-off. |
 | Strategy stuck mid-state-machine   | Any strategy in a non-idle state for >90 bars is auto-reset to its idle state.                                            |
 | Unattended overnight operation     | Process self-exit timer at `PROCESS_EXIT_AT` (15:45 CT / 16:45 ET) shuts down cleanly after IBC has closed TWS.           |
 
@@ -340,5 +340,6 @@ print(live_gfl["result_R"].describe())
 | ~~Hold-time cap~~           | **Fixed 2026-08-23.** `_detect_exit()` now honors `hold_cap_bars` (exit at bar close, reason "hold cap"; stop/TP take precedence within a bar). All params remain 0 = disabled, so behavior is unchanged until enabled. Same-symbol conflicts also now reach conflict_log.csv. Covered by `tests/test_hold_cap.py` / `tests/test_misc_p2.py`. |
 | ~~requirements.txt~~        | **Fixed 2026-08-23.** `yfinance` (and `pytest`) added.                                                                     |
 | ~~Repo hygiene~~            | **Fixed 2026-08-23.** `.gitignore` added; committed `__pycache__/*.pyc` untracked.                                         |
+| ~~EOD close fired after the market closed~~ | **Fixed 2026-08-23** (owner-approved design). Per-symbol close on the last real bar (~15:59:00 ET) + backstop at 15:59:30 ET; `finalize_fills()` runs again at process exit to catch fills reported after post-market. Covered by `tests/test_eod_close.py`. |
 | Pre-market gap calculator   | Gap is computed from prior close vs first RTH bar open. A true pre-market feed would give earlier visibility. (`PREMARKET_ROUTINE_TIME` in config is currently unused.) |
 | Tests                       | `tests/` (39 tests) covers the Group B feed handler, per-symbol session resets, ghost-exit logging, `_do_close` ordering, broker-side stops (mocked IBKR), the locking stress test, fill logging, restart preservation, hold cap, dashboard, and conflict/regime plumbing. Run `python -m pytest Stockbot/tests` from the parent directory. Still uncovered: RiskManager halt thresholds, reconcile edge cases, rate limiter, EOD timer scheduling. |

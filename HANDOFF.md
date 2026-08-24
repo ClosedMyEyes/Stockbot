@@ -370,10 +370,20 @@ DONE (in working tree, not yet committed):
       orders → unintended overnight holds. Recommendation: close on the
       last real bar (~15:59:00 ET) + backstop at 15:59:30 ET.
 
+  - 2026-08-23 (owner approved the EOD recommendation):
+    * EOD close redesigned: per-symbol close triggers on the LAST REAL bar
+      (EOD_TRIGGER_BAR=15:58, completing ~15:59:00 ET); safety backstop
+      moved to 14:59:30 CT (15:59:30 ET) — both inside the session so EOD
+      market orders fill same-day. _eod_done guards double-bookkeeping if a
+      15:59 bar ever arrives (paper replays). finalize_fills() re-runs at
+      process exit for fills reported after the earlier post-market.
+      EOD_BAR (15:59) retained for warm-up/historical parsing. Exits ~1 min
+      earlier than the backtest's 16:00 close — owner-approved trade-off.
+
 STILL OPEN (needs the owner — full detail in OWNER-CHECKLIST.md):
-  - live paper-TWS verification of the bracket flow
+  - live paper-TWS verification of the bracket flow (incl. confirming the
+    EOD order appears ~15:59:00 ET and fills before 16:00)
   - market-data line entitlement check (164 symbols vs default 100)
-  - EOD close-timing decision (above)
 
 NOTE: this repo copy of HANDOFF.md is now the living document; the copy in
 C:\Users\mark\Downloads is stale and can be deleted.
