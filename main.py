@@ -234,7 +234,10 @@ class Orchestrator:
             f"{signal.direction.upper()} @ {signal.entry_price:.4f} "
             f"stop={signal.stop:.4f} tp={signal.tp:.4f}"
         )
-        pos = self.risk.approve(signal)
+        # approve() iterates open_positions (max-cap + same-symbol checks) —
+        # lock against concurrent closes from the timer / stop-fill threads.
+        with _position_lock:
+            pos = self.risk.approve(signal)
         if pos is None:
             ll.log_signal(
                 strategy_id=signal.strategy_id, symbol=signal.symbol,
@@ -250,20 +253,22 @@ class Orchestrator:
             log.error(f"Execution failed for {pos.symbol} — not registering position")
             return
 
-        self.risk.register_position(pos)
-        strat.mark_in_trade()
+        # Register position + side-dicts as one atomic step (no network calls
+        # under the lock — send_entry already happened above).
+        with _position_lock:
+            self.risk.register_position(pos)
+            strat.mark_in_trade()
+            self._positions_meta[pos.trade_id]     = signal.meta
+            self._position_entry_bar[pos.trade_id] = self._bar_counters[signal.symbol]
+            # [R3] Queue fill verification in 2 bars
+            self._pending_verify[pos.trade_id] = (
+                pos.shares,
+                self._bar_counters[signal.symbol],
+            )
         self._signals_accepted += 1
-        self._positions_meta[pos.trade_id]     = signal.meta
-        self._position_entry_bar[pos.trade_id] = self._bar_counters[signal.symbol]
 
         # [R1] Persist state
         self.state.on_position_open(pos, self._session_date)
-
-        # [R3] Queue fill verification in 2 bars
-        self._pending_verify[pos.trade_id] = (
-            pos.shares,
-            self._bar_counters[signal.symbol],
-        )
 
         ll.log_signal(
             strategy_id=signal.strategy_id, symbol=signal.symbol,
@@ -286,27 +291,23 @@ class Orchestrator:
             return
 
         bar_now = self._bar_counters.get(bar.symbol, 0)
-        to_verify = [
-            tid for tid, (_, entry_bar) in list(self._pending_verify.items())
-            if getattr(self.risk.open_positions.get(tid), "symbol", "") == bar.symbol
-        ]
-
-        for tid in to_verify:
-            if tid not in self._pending_verify:
-                continue
-            expected_shares, entry_bar = self._pending_verify[tid]
-            if bar_now - entry_bar < 2:
-                continue
-
-            pos = self.risk.open_positions.get(tid)
-            if pos is None:
+        # Select-and-remove under the lock so a concurrent close can't pop a
+        # pending entry between our check and our del (check-then-act race).
+        to_spawn = []
+        with _position_lock:
+            for tid, (expected_shares, entry_bar) in list(self._pending_verify.items()):
+                pos = self.risk.open_positions.get(tid)
+                if pos is None:
+                    del self._pending_verify[tid]
+                    continue
+                if pos.symbol != bar.symbol:
+                    continue
+                if bar_now - entry_bar < 2:
+                    continue
                 del self._pending_verify[tid]
-                continue
+                to_spawn.append((tid, pos, expected_shares))
 
-            if pos.symbol != bar.symbol:
-                continue
-
-            del self._pending_verify[tid]
+        for tid, pos, expected_shares in to_spawn:
             # Run the blocking IBKR query in a background thread so the event loop
             # is never blocked. Capture tid/pos in closure.
             threading.Thread(
@@ -335,8 +336,18 @@ class Orchestrator:
                 f"FillVerify {tid} ({pos.symbol}): PARTIAL FILL — "
                 f"expected {expected_shares}, actual {actual}. Adjusting."
             )
-            pos.shares = actual
-            self.state.on_shares_adjusted(tid, actual)
+            # Adjust the LIVE position under the lock — the software close and
+            # this thread would otherwise race on shares/R_dollars. Recompute
+            # R_dollars too, so pnl_dollars (= result_r * R_dollars) stays
+            # consistent with the shares-based P&L in the risk manager.
+            with _position_lock:
+                live = self.risk.open_positions.get(tid)
+                if live is None:
+                    return  # closed while we were verifying — nothing to adjust
+                live.shares = actual
+                live.R_dollars = actual * abs(live.entry_price - live.stop)
+                r_dollars = live.R_dollars
+            self.state.on_shares_adjusted(tid, actual, r_dollars)
 
         else:
             log.info(f"FillVerify {tid} ({pos.symbol}): OK — {actual} shares confirmed")
@@ -372,22 +383,30 @@ class Orchestrator:
 
     def _clear_failed_fill(self, trade_id: str, pos: OpenPosition):
         """Remove a position that completely failed to fill."""
+        # Popping the position under the lock is the ownership test: whichever
+        # path (this, or a concurrent close) pops it first wins; the loser
+        # backs out. Prevents a double-terminal on the same trade_id.
+        with _position_lock:
+            live = self.risk.open_positions.pop(trade_id, None)
+            if live is None:
+                return  # already closed/cleared by another path
+            self._positions_meta.pop(trade_id, None)
+            self._position_entry_bar.pop(trade_id, None)
+            self._pending_verify.pop(trade_id, None)
+            for strat in self.strategies.get(pos.symbol, []):
+                if strat.strategy_id == pos.strategy_id and strat._in_trade:
+                    strat._in_trade = False
+                    break
+
         # Cancel the unfilled entry order and its attached protective stop —
         # otherwise the orphaned GTC stop could fire later and OPEN a position.
+        # (Outside the lock: the IBKR call is dispatched to the event loop.)
         try:
             self.executor.cancel_order(pos)
         except Exception as e:
             log.error(f"cancel_order failed for {trade_id}: {e}")
 
-        self.risk.open_positions.pop(trade_id, None)
         self.state.on_position_close(trade_id, 0.0, 0.0)  # 0R, $0 — no fill
-        self._positions_meta.pop(trade_id, None)
-        self._position_entry_bar.pop(trade_id, None)
-
-        for strat in self.strategies.get(pos.symbol, []):
-            if strat.strategy_id == pos.strategy_id and strat._in_trade:
-                strat._in_trade = False
-                break
 
         log.warning(
             f"FAILED FILL CLEARED — if you see this position on your broker, "
@@ -402,15 +421,19 @@ class Orchestrator:
     # =========================================================================
 
     def _check_exits(self, bar: Bar, ctx: SessionContext):
-        to_close = []
-        for trade_id, pos in self.risk.open_positions.items():
-            if pos.symbol != bar.symbol:
-                continue
+        # Snapshot under the lock — the EOD timer / stop-fill threads mutate
+        # open_positions concurrently and dict iteration would blow up.
+        with _position_lock:
+            candidates = [
+                (tid, pos) for tid, pos in self.risk.open_positions.items()
+                if pos.symbol == bar.symbol
+            ]
+        for trade_id, pos in candidates:
             exit_p, reason = self._detect_exit(bar, pos)
             if exit_p is not None:
-                to_close.append((trade_id, pos, exit_p, reason))
-        for trade_id, pos, exit_p, reason in to_close:
-            self._close_position(trade_id, pos, exit_p, reason, bar)
+                # _do_close re-checks ownership via close_position — a position
+                # closed by another thread since the snapshot is a no-op here.
+                self._close_position(trade_id, pos, exit_p, reason, bar)
 
     def _detect_exit(self, bar: Bar, pos: OpenPosition):
         """Returns (exit_price, reason) or (None, None)."""
@@ -443,8 +466,15 @@ class Orchestrator:
         and _force_close (EOD timer / no-bar callers).
         Fires executor.send_exit, writes ll.log_trade, updates state.json.
         """
+        # close_position is the atomic ownership test (pops the position);
+        # the side-dict pops ride in the same critical section. Everything
+        # slow or fallible (orders, callbacks, CSV) happens after release.
         with _position_lock:
             result_r = self.risk.close_position(trade_id, exit_price, reason)
+            if result_r is not None:
+                meta      = self._positions_meta.pop(trade_id, {})
+                entry_bar = self._position_entry_bar.pop(trade_id, 0)
+                self._pending_verify.pop(trade_id, None)
         if result_r is None:
             return
 
@@ -463,16 +493,13 @@ class Orchestrator:
                     log.error(f"on_exit error [{strat}]: {e}", exc_info=True)
                 break
 
-        bars_held = (self._bar_counters.get(pos.symbol, 0)
-                     - self._position_entry_bar.get(trade_id, 0))
+        bars_held = self._bar_counters.get(pos.symbol, 0) - entry_bar
 
         ll.log_trade(
             pos=pos, exit_price=exit_price, exit_time=exit_time_str,
             exit_reason=reason, result_r=result_r, bars_to_exit=bars_held,
-            meta=self._positions_meta.pop(trade_id, {}),
+            meta=meta,
         )
-        self._position_entry_bar.pop(trade_id, None)
-        self._pending_verify.pop(trade_id, None)
 
         # [R1] Persist updated state
         self.state.on_position_close(trade_id, result_r, pnl_dollars)
@@ -531,10 +558,11 @@ class Orchestrator:
 
     def _eod_close(self, bar: Bar, ctx: SessionContext):
         """Force-close open positions for this symbol. Store prior_close."""
-        to_close = [
-            (tid, pos) for tid, pos in self.risk.open_positions.items()
-            if pos.symbol == bar.symbol
-        ]
+        with _position_lock:
+            to_close = [
+                (tid, pos) for tid, pos in self.risk.open_positions.items()
+                if pos.symbol == bar.symbol
+            ]
         for trade_id, pos in to_close:
             self._close_position(trade_id, pos, bar.close, "EOD close", bar)
             self._eod_closes += 1
@@ -568,7 +596,11 @@ class Orchestrator:
 
         def _eod_safety():
             log.info("EOD SAFETY TIMER fired — forcing close of any remaining open positions")
-            for trade_id, pos in list(self.risk.open_positions.items()):
+            # Snapshot under the lock (timer thread vs event-loop mutations);
+            # _do_close's ownership check makes a since-closed entry a no-op.
+            with _position_lock:
+                snapshot = list(self.risk.open_positions.items())
+            for trade_id, pos in snapshot:
                 # Use last known bar close for this symbol; fall back to entry_price
                 # (0R) only if we genuinely have no price data at all.
                 exit_price = self._last_close.get(pos.symbol, pos.entry_price)
@@ -712,7 +744,8 @@ class Orchestrator:
             self._eod_timer = None
 
         log.info(f"Post-market routine for {session_date}")
-        risk_sum = self.risk.summary()
+        with _position_lock:
+            risk_sum = self.risk.summary()  # iterates open_positions
         ll.log_daily_summary(
             session=session_date, risk_summary=risk_sum,
             signal_count=self._signal_count, accepted=self._signals_accepted,
@@ -767,12 +800,15 @@ class Orchestrator:
             # Reconnected — reconcile state
             log.info("Reconnected. Reconciling state...")
             try:
-                restored, ghosts, orphans = self.state.reconcile(
-                    ib           = feed._ib,
-                    risk_manager = self.risk,
-                    strategy_map = self.strategies,
-                    session_date = self._session_date,
-                )
+                # Reconcile restores positions + strategy flags — atomic vs
+                # the EOD timer, which can fire during a reconnect window.
+                with _position_lock:
+                    restored, ghosts, orphans = self.state.reconcile(
+                        ib           = feed._ib,
+                        risk_manager = self.risk,
+                        strategy_map = self.strategies,
+                        session_date = self._session_date,
+                    )
                 log.info(
                     f"Reconciliation: restored={restored} "
                     f"ghost_closed={ghosts} orphans={orphans}"
@@ -839,19 +875,20 @@ class Orchestrator:
 
         log.info(f"Found today's state file — reconciling with IBKR")
         self.state.restore_from_dict(saved)
-        restored, ghosts, orphans = self.state.reconcile(
-            ib           = feed._ib,
-            risk_manager = self.risk,
-            strategy_map = self.strategies,
-            session_date = today,
-        )
+        with _position_lock:
+            restored, ghosts, orphans = self.state.reconcile(
+                ib           = feed._ib,
+                risk_manager = self.risk,
+                strategy_map = self.strategies,
+                session_date = today,
+            )
+            # Restore per-position meta so exit detection has gap_dir etc.
+            for tid, snap in self.state.saved_positions.items():
+                self._positions_meta[tid] = snap.get("meta", {})
         log.info(
             f"Startup reconciliation: restored={restored} "
             f"ghost_closed={ghosts} orphans={orphans}"
         )
-        # Restore per-position meta so exit detection has gap_dir etc.
-        for tid, snap in self.state.saved_positions.items():
-            self._positions_meta[tid] = snap.get("meta", {})
 
         # Restore daily stats from state
         self.risk.restore_session_stats(

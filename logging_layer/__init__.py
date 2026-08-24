@@ -11,6 +11,7 @@ Writes three logs:
 import csv
 import logging
 import os
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -19,18 +20,23 @@ from .. import config
 
 log = logging.getLogger("logging_layer")
 
+# Trades close from several threads (event loop, EOD timer, broker-stop
+# fills) — serialise CSV appends so rows and headers never interleave.
+_write_lock = threading.Lock()
+
 
 def _ensure_dir():
     os.makedirs(config.LOG_DIR, exist_ok=True)
 
 
 def _write_row(path: str, row: dict, fieldnames: list):
-    exists = os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in fieldnames})
+    with _write_lock:
+        exists = os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not exists:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
 # ── Trade log ─────────────────────────────────────────────────────────────────

@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from typing import Dict, Optional, Tuple
 
@@ -109,21 +110,27 @@ class StateManager:
         self._daily_pnl = 0.0
         # Serialisable position snapshots (not OpenPosition objects)
         self._positions: Dict[str, dict] = {}
+        # Mutations arrive from several threads (event loop, EOD timer,
+        # fill-verification, reconnect). save() serialises _positions —
+        # a concurrent mutation mid-dump would raise. RLock because
+        # reconcile() mutates and then calls save() itself.
+        self._lock = threading.RLock()
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
     def save(self) -> None:
         """Write current state atomically. Call after every position change."""
-        try:
-            _atomic_write(self._path, {
-                "session_date":    self._session,
-                "halted":          self._halted,
-                "daily_r_total":   round(self._daily_r,   4),
-                "daily_pnl_dollars": round(self._daily_pnl, 4),
-                "open_positions":  self._positions,
-            })
-        except Exception as e:
-            log.error(f"StateManager.save() failed: {e}")
+        with self._lock:
+            try:
+                _atomic_write(self._path, {
+                    "session_date":    self._session,
+                    "halted":          self._halted,
+                    "daily_r_total":   round(self._daily_r,   4),
+                    "daily_pnl_dollars": round(self._daily_pnl, 4),
+                    "open_positions":  self._positions,
+                })
+            except Exception as e:
+                log.error(f"StateManager.save() failed: {e}")
 
     def load(self) -> Optional[dict]:
         """
@@ -146,25 +153,32 @@ class StateManager:
 
     def restore_from_dict(self, data: dict) -> None:
         """Populate internal state from a previously loaded dict."""
-        self._session    = data.get("session_date", "")
-        self._halted     = data.get("halted", False)
-        self._daily_r    = data.get("daily_r_total", 0.0)
-        self._daily_pnl  = data.get("daily_pnl_dollars", 0.0)
-        self._positions  = data.get("open_positions", {})
+        with self._lock:
+            self._session    = data.get("session_date", "")
+            self._halted     = data.get("halted", False)
+            self._daily_r    = data.get("daily_r_total", 0.0)
+            self._daily_pnl  = data.get("daily_pnl_dollars", 0.0)
+            self._positions  = data.get("open_positions", {})
 
     def clear_session(self) -> None:
         """Reset all state at the start of a new trading day."""
-        self._positions  = {}
-        self._halted     = False
-        self._daily_r    = 0.0
-        self._daily_pnl  = 0.0
-        self.save()
+        with self._lock:
+            self._positions  = {}
+            self._halted     = False
+            self._daily_r    = 0.0
+            self._daily_pnl  = 0.0
+            self.save()
 
     # ── Position tracking (called by orchestrator) ────────────────────────────
 
     def on_position_open(self, pos, session_date: str) -> None:
         """Record a new position and persist."""
-        self._session = session_date
+        with self._lock:
+            self._session = session_date
+            self._add_position_snapshot(pos)
+            self.save()
+
+    def _add_position_snapshot(self, pos) -> None:
         self._positions[pos.trade_id] = {
             "trade_id":    pos.trade_id,
             "symbol":      pos.symbol,
@@ -179,34 +193,48 @@ class StateManager:
             "stop_order_id": getattr(pos, "stop_order_id", None),
             "meta":        getattr(pos, "meta", {}),
         }
-        self.save()
 
     def on_position_close(self, trade_id: str, result_r: float,
                           pnl_dollars: float) -> None:
         """Remove a position and update daily stats, then persist."""
-        self._positions.pop(trade_id, None)
-        self._daily_r   += result_r
-        self._daily_pnl += pnl_dollars
-        self.save()
+        with self._lock:
+            self._positions.pop(trade_id, None)
+            self._daily_r   += result_r
+            self._daily_pnl += pnl_dollars
+            self.save()
 
     def on_halt(self, halted: bool) -> None:
-        self._halted = halted
-        self.save()
-
-    def on_shares_adjusted(self, trade_id: str, actual_shares: int) -> None:
-        """Update shares after fill verification detects a partial fill."""
-        if trade_id in self._positions:
-            self._positions[trade_id]["shares"] = actual_shares
+        with self._lock:
+            self._halted = halted
             self.save()
+
+    def on_shares_adjusted(self, trade_id: str, actual_shares: int,
+                           r_dollars: float = None) -> None:
+        """Update shares (and re-derived R_dollars) after fill verification
+        detects a partial fill."""
+        with self._lock:
+            if trade_id in self._positions:
+                self._positions[trade_id]["shares"] = actual_shares
+                if r_dollars is not None:
+                    self._positions[trade_id]["R_dollars"] = r_dollars
+                self.save()
 
     @property
     def saved_positions(self) -> Dict[str, dict]:
-        return dict(self._positions)
+        with self._lock:
+            return dict(self._positions)
 
     # ── IBKR Reconciliation ───────────────────────────────────────────────────
 
     def reconcile(self, ib, risk_manager, strategy_map: dict,
                   session_date: str) -> Tuple[int, int, int]:
+        """Thread-safe wrapper — see _reconcile_impl for the logic."""
+        with self._lock:
+            return self._reconcile_impl(ib, risk_manager, strategy_map,
+                                        session_date)
+
+    def _reconcile_impl(self, ib, risk_manager, strategy_map: dict,
+                        session_date: str) -> Tuple[int, int, int]:
         """
         Compare state.json positions against actual IBKR positions.
         Returns (restored, ghost_closed, orphans_found).
