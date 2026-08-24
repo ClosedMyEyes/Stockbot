@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime output
+logs/
+regime.json
+
+# Secrets / local config
+.env
